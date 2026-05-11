@@ -464,14 +464,33 @@ PROMPT_ACTION_EXEC_REL = f"{PROMPT_OUTPUT_DIR}/<PROJECT>-04-动作执行记录.m
 PROMPT_ATOMIZED_REL = f"{PROMPT_OUTPUT_DIR}/<PROJECT>-05-原子风险清单.md"
 PROMPT_QUALITY_REL = f"{PROMPT_OUTPUT_DIR}/<PROJECT>-06-质量门检查表.md"
 PROMPT_RUN_REL = f"{PROMPT_OUTPUT_DIR}/<PROJECT>-AI调度运行记录.md"
-PROMPT_REVIEW_DATE = "<REVIEW_DATE>"
-PROMPT_REVIEW_TIME = "<REVIEW_TIME>"
+PROMPT_REVIEW_START = "<REVIEW_START_TIME>"
+PROMPT_REVIEW_END = "<REVIEW_END_TIME>"
 
 
 def replace_prompt_placeholders(text: str, replacements: dict[str, str]) -> str:
     for placeholder, value in sorted(replacements.items(), key=lambda item: len(item[0]), reverse=True):
         text = text.replace(placeholder, value)
     return text
+
+
+def remove_legacy_report_metadata(text: str) -> str:
+    legacy_keys = {
+        "类型",
+        "状态",
+        "审查日期",
+        "审查时间",
+        "审查人",
+        "外部标注使用",
+        "LLM Wiki修改",
+        "LLM Wiki维护命令",
+    }
+    lines = [
+        line
+        for line in text.splitlines()
+        if not any(line.startswith(f"{key}::") for key in legacy_keys)
+    ]
+    return "\n".join(lines).strip()
 
 
 def chat_text(base_url: str, api_key: str, model: str, prompt: str, max_tokens: int = 8000) -> tuple[str, dict]:
@@ -588,6 +607,7 @@ def direct_chat_review(
     now = local_now()
     review_date = now.strftime("%Y-%m-%d")
     review_time = now.strftime("%H:%M:%S CST")
+    review_start_time = now.strftime("%Y-%m-%d %H:%M:%S CST")
     category = output_category(target)
     output_dir, output_rel_dir = make_run_output_dir(biz_home, category, now)
 
@@ -620,8 +640,7 @@ def direct_chat_review(
         PROMPT_ATOMIZED_REL: atomized_rel,
         PROMPT_QUALITY_REL: quality_rel,
         PROMPT_RUN_REL: run_rel,
-        PROMPT_REVIEW_DATE: review_date,
-        PROMPT_REVIEW_TIME: review_time,
+        PROMPT_REVIEW_START: review_start_time,
     }
 
     raw_text = extract_file_text(target_path)
@@ -1021,15 +1040,9 @@ def direct_chat_review(
 
 请执行入口指引中的环节七：报告生成，输出 `07-AI审查记录` Markdown 内容。
 
-报告顶部必须包含：
-类型:: 审查记录
-状态:: AI 审查版
-审查日期:: {PROMPT_REVIEW_DATE}
-审查时间:: {PROMPT_REVIEW_TIME}
-审查人:: AI 审查
-外部标注使用:: 否
-LLM Wiki修改:: 否
-LLM Wiki维护命令:: 否
+报告顶部只保留以下两项审查时间，不得输出 `类型::`、`状态::`、`审查日期::`、`审查时间::`、`审查人::`、`外部标注使用::`、`LLM Wiki修改::`、`LLM Wiki维护命令::`：
+审查开始时间:: {PROMPT_REVIEW_START}
+审查结束时间:: {PROMPT_REVIEW_END}
 
 报告必须包含：
 1. 审查摘要
@@ -1072,7 +1085,10 @@ LLM Wiki维护命令:: 否
     if not report:
         print("pipeline returned empty report", file=sys.stderr)
         return 1
+    review_end_time = local_now().strftime("%Y-%m-%d %H:%M:%S CST")
+    report_replacements[PROMPT_REVIEW_END] = review_end_time
     report = replace_prompt_placeholders(report, report_replacements)
+    report = remove_legacy_report_metadata(report)
 
     report_path.write_text(report.rstrip() + "\n", encoding="utf-8")
     risk_count = count_risks(report)
