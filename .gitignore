@@ -4,6 +4,7 @@ __pycache__/
 *.tmp
 *.log
 dist/
+outputs/
 
 # Local LLM credentials.
 config/auth.json
