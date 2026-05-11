@@ -8,11 +8,10 @@
 
 ```text
 agents/hegui-agent/      # hegui_cli.py、提示词和 manifest
-runtime/bin/             # core-proxy-cli
-runtime/config/          # 独立 CODEX_HOME
-runtime/home/            # 独立 HOME，运行时自动创建
 outputs/                 # 审查报告和运行记录输出目录
 config/hegui.yaml        # 指向 LLM Wiki 的配置
+config/config.toml       # LLM 服务和模型配置
+config/auth.json         # 本地鉴权配置
 ```
 
 ## 审查
@@ -21,7 +20,7 @@ config/hegui.yaml        # 指向 LLM Wiki 的配置
 agents/hegui-agent/hegui_cli.py '<待审查文件相对路径>'
 ```
 
-相对路径基于 `config/hegui.yaml` 中的 `wiki_home` 解析。入口只接收待审查文件，文件画像、品类路由和专项动作由 LLM Wiki 审查协议决定。
+入口只接收待审查文件，文件画像、品类路由和专项动作由 LLM Wiki 审查协议决定。
 
 ## 产物
 

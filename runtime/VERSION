@@ -1,5 +1,0 @@
-source_url: https://github.com/openai/codex.git
-release: rust-v0.130.0
-platform: aarch64-apple-darwin
-binary_version: codex-cli 0.130.0
-runtime_file: runtime/bin/core-proxy-cli

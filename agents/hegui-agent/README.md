@@ -2,7 +2,7 @@
 
 `hegui-agent` 是政府采购行业招标文件合规性审查生产线的 Agent 封装层。
 
-它只做一件事：接收一个待审查招标文件，读取 `config/hegui.yaml` 指向的只读 LLM Wiki 知识，调用隔离 Codex 运行时完成审查，并把审查报告和运行记录输出到 `outputs/`。
+它只做一件事：接收一个待审查招标文件，读取 `config/hegui.yaml` 指向的只读 LLM Wiki 知识，调用 `config/` 中的 LLM 配置完成审查，并把审查报告和运行记录输出到 `outputs/`。
 
 ## 使用方式
 
@@ -10,19 +10,19 @@
 agents/hegui-agent/hegui_cli.py '<待审查文件相对路径>'
 ```
 
-待审查文件路径基于 `config/hegui.yaml` 中的 `wiki_home` 解析。执行器只校验文件存在于只读 LLM Wiki 内，文件画像、品类路由和专项动作由 LLM Wiki 审查协议决定。
+待审查文件可以使用本项目内相对路径，也可以使用本项目内文件的绝对路径。文件画像、品类路由和专项动作由 LLM Wiki 审查协议决定。
 
 ## 运行时
 
-`hegui_cli.py` 默认使用独立运行时：
+`hegui_cli.py` 直接读取本项目配置：
 
 ```text
-runtime/bin/core-proxy-cli
-runtime/config
-runtime/home
+config/hegui.yaml
+config/config.toml
+config/auth.json
 ```
 
-隔离环境需要将真实模型配置和鉴权信息放入 `runtime/config/`。业务审查不依赖使用者本机的 Codex 配置、规则、技能和缓存。
+`config/config.toml` 提供模型、服务地址等配置，`config/auth.json` 提供鉴权信息。执行器直接调用 LLM 服务完成分阶段审查。
 
 ## 输出
 

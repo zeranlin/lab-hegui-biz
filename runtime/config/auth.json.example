@@ -1,3 +1,0 @@
-{
-  "说明": "不要提交真实 auth.json。隔离环境可使用环境变量或将实际鉴权文件放在 runtime/config/auth.json。"
-}

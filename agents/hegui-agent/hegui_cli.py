@@ -4,13 +4,10 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
-import os
 import re
 import subprocess
 import sys
-import tempfile
 import urllib.error
 import urllib.request
 from datetime import datetime
@@ -32,33 +29,8 @@ def read_simple_yaml_value(path: Path, key: str) -> str | None:
     return None
 
 
-def file_digest(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def snapshot_tree(root: Path, out: Path) -> None:
-    rows: list[str] = []
-    for path in sorted(root.rglob("*")):
-        relative_parts = path.relative_to(root).parts
-        if any(part.startswith(".") for part in relative_parts) or not path.is_file():
-            continue
-        stat = path.stat()
-        relative = path.relative_to(root).as_posix()
-        rows.append(f"{file_digest(path)}  {relative}")
-        rows.append(f"{relative} {stat.st_size} {int(stat.st_mtime)}")
-    out.write_text("\n".join(rows) + "\n", encoding="utf-8")
-
-
-def read_text(path: Path) -> str:
-    return path.read_text(encoding="utf-8")
-
-
-def read_auth_key(codex_home: Path) -> str:
-    auth_file = codex_home / "auth.json"
+def read_auth_key(config_dir: Path) -> str:
+    auth_file = config_dir / "auth.json"
     if not auth_file.is_file():
         return ""
     data = json.loads(auth_file.read_text(encoding="utf-8"))
@@ -224,6 +196,70 @@ def read_wiki_pages(wiki_home: Path, pages: list[str]) -> str:
     return "".join(chunks)
 
 
+def estimate_tokens(text: str) -> int:
+    # Chinese-heavy prompt rough estimate. Used for budgeting and run records only.
+    return round(len(text) / 1.5)
+
+
+def budget_wiki_pages(wiki_home: Path, pages: list[str], char_budget: int) -> tuple[str, list[str]]:
+    chunks: list[str] = []
+    loaded: list[str] = []
+    seen: set[str] = set()
+    used = 0
+    for rel in pages:
+        rel = normalize_wiki_ref(rel) or rel
+        if rel in seen or not is_allowed_knowledge_page(rel):
+            continue
+        seen.add(rel)
+        text = read_wiki_page(wiki_home, rel)
+        if not text:
+            continue
+        chunk = f"\n\n# {rel}\n\n{text}"
+        if chunks and used + len(chunk) > char_budget:
+            continue
+        chunks.append(chunk)
+        loaded.append(rel)
+        used += len(chunk)
+    return "".join(chunks), loaded
+
+
+CORE_EXECUTION_PAGES = [
+    ENTRY_GUIDE,
+    "wiki/70-审查协议/知识驱动审查执行规范.md",
+    "wiki/70-审查协议/政府采购招标文件业务审查流水线.md",
+    "wiki/70-审查协议/政府采购招标文件审查协议.md",
+    "wiki/20-知识点/知识分层与路由规则.md",
+    "wiki/20-知识点/政府采购逐章审查矩阵.md",
+    "wiki/70-审查协议/风险原子化规则.md",
+    "wiki/70-审查协议/质量门规则.md",
+    "wiki/25-风险审查点/风险审查点总览.md",
+    "wiki/90-模板/审查记录模板.md",
+    "wiki/90-模板/AI调度运行记录模板.md",
+]
+
+
+PROFILE_PAGES = [
+    ENTRY_GUIDE,
+    "wiki/20-知识点/政府采购招标文件画像.md",
+    "wiki/15-行业基础/政府采购专项场景画像.md",
+    "wiki/60-提示词/招标文件画像提示词.md",
+]
+
+
+def domain_pages_from_profile(profile: str, target: str) -> list[str]:
+    text = f"{target}\n{profile}"
+    pages: list[str] = []
+    if "物业" in text:
+        pages.extend(
+            [
+                "wiki/15-行业基础/物业管理服务采购背景.md",
+                "wiki/20-知识点/物业管理动作化审查包.md",
+                "wiki/70-审查协议/物业管理审查动作协议.md",
+            ]
+        )
+    return pages
+
+
 def risk_review_point_catalog(wiki_home: Path) -> str:
     root = wiki_home / "wiki/25-风险审查点"
     if not root.is_dir():
@@ -292,12 +328,12 @@ def direct_chat_review(
     target_path: Path,
     biz_home: Path,
     wiki_home: Path,
-    codex_home: Path,
+    config_dir: Path,
 ) -> int:
-    config_toml = codex_home / "config.toml"
+    config_toml = config_dir / "config.toml"
     base_url = read_toml_string(config_toml, "base_url")
     model = read_toml_string(config_toml, "model")
-    api_key = read_auth_key(codex_home)
+    api_key = read_auth_key(config_dir)
     if not base_url or not model or not api_key:
         print("direct chat config incomplete", file=sys.stderr)
         return 1
@@ -332,8 +368,8 @@ def direct_chat_review(
     numbered_text = line_number_text(raw_text)
     extract_path.write_text(numbered_text + "\n", encoding="utf-8")
 
-    knowledge, knowledge_pages = collect_entry_driven_knowledge(wiki_home)
     usages: list[tuple[str, dict]] = []
+    prompt_stats: list[tuple[str, int, int]] = []
     stage_paths = [
         ("01-文件画像", profile_rel),
         ("02-知识路由表", route_rel),
@@ -344,6 +380,8 @@ def direct_chat_review(
         ("07-AI审查记录", report_rel),
         ("08-运行记录", run_rel),
     ]
+
+    core_knowledge, core_pages = budget_wiki_pages(wiki_home, CORE_EXECUTION_PAGES, char_budget=52000)
 
     shared_context = f"""你是政府采购招标文件合规审查生产线的外部执行主体。
 
@@ -362,22 +400,11 @@ def direct_chat_review(
 - 抽取文本：{extract_rel}
 - 输出目录：{output_rel_dir}
 
-入口指引动态装载的 LLM Wiki 知识：
-{knowledge}
+本阶段核心 LLM Wiki 知识：
+{core_knowledge}
 """
 
-    profile_knowledge = read_wiki_pages(
-        wiki_home,
-        [
-            ENTRY_GUIDE,
-            "wiki/20-知识点/政府采购招标文件画像.md",
-            "wiki/60-提示词/招标文件画像提示词.md",
-        ],
-    )
-    source_context = f"""{shared_context}
-待审文件，已加行号：
-{numbered_text}
-"""
+    profile_knowledge, profile_pages = budget_wiki_pages(wiki_home, PROFILE_PAGES, char_budget=26000)
 
     profile_prompt = f"""你是政府采购招标文件合规审查生产线的外部执行主体。
 
@@ -401,25 +428,78 @@ def direct_chat_review(
 只输出 `01-文件画像` Markdown 内容。不得输出风险清单，不得生成最终报告。
 必须满足入口指引中 `01-文件画像` 的字段和通过条件；未见字段写 `未见`，不确定字段写 `待确认`。
 """
+    prompt_stats.append(("01-文件画像", len(profile_prompt), estimate_tokens(profile_prompt)))
     profile, usage = chat_text(base_url, api_key, model, profile_prompt, max_tokens=1000)
     usages.append(("01-文件画像", usage))
     stage_file(profile_path, "01-文件画像", profile)
 
-    route_prompt = f"""{shared_context}
+    domain_pages = domain_pages_from_profile(profile, target)
+    route_knowledge, route_pages = budget_wiki_pages(
+        wiki_home,
+        [
+            *CORE_EXECUTION_PAGES,
+            "wiki/20-知识点/政府采购招标文件画像.md",
+            "wiki/15-行业基础/政府采购专项场景画像.md",
+            *domain_pages,
+        ],
+        char_budget=62000,
+    )
+    route_catalog = f"""## 风险审查点目录
+
+{risk_review_point_catalog(wiki_home)}
+
+## 法规依据目录
+
+{law_catalog(wiki_home)}
+"""
+
+    route_prompt = f"""你是政府采购招标文件合规审查生产线的外部执行主体。
+
+请执行入口指引中的环节二：知识路由。本阶段不读取同一项目历史记录，不输出风险清单，不生成最终报告。
+报告和中间产物不得出现绝对路径。
+
+本次文件位置：
+- 原始文件：{target}
+- 抽取文本：{extract_rel}
+- 输出目录：{output_rel_dir}
+
+路由阶段 LLM Wiki 知识：
+{route_knowledge}
+
+可选知识目录：
+{route_catalog}
 
 已生成文件画像：
 {profile}
 
-请执行入口指引中的环节二：知识路由。
-
 只输出 `02-知识路由表` Markdown 内容。不得输出风险清单，不得生成最终报告。
 必须说明每个调用知识页的调用原因、适用层级、是否必读和执行状态。
+每个知识页请尽量使用相对于 LLM Wiki 的稳定路径。
 """
+    prompt_stats.append(("02-知识路由表", len(route_prompt), estimate_tokens(route_prompt)))
     route, usage = chat_text(base_url, api_key, model, route_prompt, max_tokens=6000)
     usages.append(("02-知识路由表", usage))
     stage_file(route_path, "02-知识路由表", route)
 
-    actions_prompt = f"""{shared_context}
+    routed_refs = extract_wiki_refs(route)
+    action_knowledge, action_pages = budget_wiki_pages(
+        wiki_home,
+        [*CORE_EXECUTION_PAGES, *domain_pages, *routed_refs],
+        char_budget=62000,
+    )
+
+    actions_prompt = f"""你是政府采购招标文件合规审查生产线的外部执行主体。
+
+请执行入口指引中的环节三：动作清单。本阶段只生成动作，不输出风险详情，不生成最终报告。
+报告和中间产物不得出现绝对路径。
+
+本次文件位置：
+- 原始文件：{target}
+- 抽取文本：{extract_rel}
+- 输出目录：{output_rel_dir}
+
+动作清单阶段 LLM Wiki 知识：
+{action_knowledge}
 
 文件画像：
 {profile}
@@ -432,15 +512,26 @@ def direct_chat_review(
 只输出 `03-动作清单` Markdown 内容。不得输出风险详情，不得生成最终报告。
 动作必须来自知识路由结果、逐章矩阵、通用审查协议和命中的品类动作协议。
 """
+    prompt_stats.append(("03-动作清单", len(actions_prompt), estimate_tokens(actions_prompt)))
     actions, usage = chat_text(base_url, api_key, model, actions_prompt, max_tokens=8000)
     usages.append(("03-动作清单", usage))
     stage_file(actions_path, "03-动作清单", actions)
+
+    action_refs = extract_wiki_refs(actions)
+    review_knowledge, review_pages = budget_wiki_pages(
+        wiki_home,
+        [*CORE_EXECUTION_PAGES, *domain_pages, *routed_refs, *action_refs],
+        char_budget=62000,
+    )
 
     action_exec_prompt = f"""你是政府采购招标文件合规审查生产线的外部执行主体。
 
 请根据入口指引、文件画像、知识路由表和动作清单，执行环节四：逐动作执行。
 风险判断只能来自已路由知识、动作清单和待审文件原文；不得使用外部标注、标准答案、历史审查记录或执行器内置审查知识。
 报告和中间产物不得出现绝对路径。原文内容字段只能放待审文件原文。
+
+逐动作执行阶段 LLM Wiki 知识：
+{review_knowledge}
 
 文件画像：
 {profile}
@@ -459,11 +550,18 @@ def direct_chat_review(
 只输出 `04-动作执行记录` Markdown 内容。不要生成最终报告。
 每个动作都必须有状态、读取范围、原文位置或未命中原因；命中和待确认动作必须形成候选风险或说明待确认原因。
 """
+    prompt_stats.append(("04-动作执行记录", len(action_exec_prompt), estimate_tokens(action_exec_prompt)))
     action_exec, usage = chat_text(base_url, api_key, model, action_exec_prompt, max_tokens=14000)
     usages.append(("04-动作执行记录", usage))
     stage_file(action_exec_path, "04-动作执行记录", action_exec)
 
-    atomized_prompt = f"""{shared_context}
+    atomized_prompt = f"""你是政府采购招标文件合规审查生产线的外部执行主体。
+
+请执行入口指引中的环节五：风险原子化。本阶段只处理动作执行记录中的候选风险。
+不得使用外部标注、标准答案、历史审查记录或执行器内置审查知识。不得出现绝对路径。
+
+风险原子化阶段 LLM Wiki 知识：
+{review_knowledge}
 
 文件画像：
 {profile}
@@ -482,11 +580,18 @@ def direct_chat_review(
 只输出 `05-原子风险清单` Markdown 内容。不要生成最终报告。
 必须按 LLM Wiki 风险原子化规则拆分候选风险；每个风险必须能反链来源动作和关联审查点。
 """
+    prompt_stats.append(("05-原子风险清单", len(atomized_prompt), estimate_tokens(atomized_prompt)))
     atomized, usage = chat_text(base_url, api_key, model, atomized_prompt, max_tokens=12000)
     usages.append(("05-原子风险清单", usage))
     stage_file(atomized_path, "05-原子风险清单", atomized)
 
-    quality_prompt = f"""{shared_context}
+    quality_prompt = f"""你是政府采购招标文件合规审查生产线的外部执行主体。
+
+请执行入口指引中的环节六：质量门反查。
+不得使用外部标注、标准答案、历史审查记录或执行器内置审查知识。不得出现绝对路径。
+
+质量门阶段 LLM Wiki 知识：
+{review_knowledge}
 
 文件画像：
 {profile}
@@ -508,6 +613,7 @@ def direct_chat_review(
 只输出 `06-质量门检查表` Markdown 内容。不要生成最终报告。
 必须检查入口指引列出的最低质量门；如风险数量偏低，必须执行异常低风险数量反查并记录反查范围和结论。
 """
+    prompt_stats.append(("06-质量门检查表", len(quality_prompt), estimate_tokens(quality_prompt)))
     quality, usage = chat_text(base_url, api_key, model, quality_prompt, max_tokens=8000)
     usages.append(("06-质量门检查表", usage))
     stage_file(quality_path, "06-质量门检查表", quality)
@@ -580,6 +686,7 @@ LLM Wiki维护命令:: 否
 原文内容只能是原文摘录。
 不得出现绝对路径。
 """
+    prompt_stats.append(("07-AI审查记录", len(report_prompt), estimate_tokens(report_prompt)))
     report, usage = chat_text(base_url, api_key, model, report_prompt, max_tokens=16000)
     usages.append(("07-AI审查记录", usage))
     if not report:
@@ -593,8 +700,10 @@ LLM Wiki维护命令:: 否
         f"| {name} | {usage.get('prompt_tokens', '')} | {usage.get('completion_tokens', '')} | {usage.get('total_tokens', '')} |"
         for name, usage in usages
     )
+    prompt_size_rows = "\n".join(f"| {name} | {chars} | {tokens} |" for name, chars, tokens in prompt_stats)
     stage_rows = "\n".join(f"| {name} | {path} |" for name, path in stage_paths)
-    knowledge_rows = "\n".join(f"- {page}" for page in knowledge_pages)
+    knowledge_pages = [*profile_pages, *route_pages, *action_pages, *review_pages]
+    knowledge_rows = "\n".join(f"- {page}" for page in dict.fromkeys(knowledge_pages))
 
     run_record = f"""类型:: AI调度运行记录
 状态:: 已完成
@@ -648,7 +757,15 @@ LLM Wiki维护命令:: 否
 
 ## 5. 模型交互说明
 
-本次按入口指引执行分阶段知识驱动流水线，返回用量：
+本次按入口指引执行分阶段知识驱动流水线。执行器按阶段装载知识包，避免每轮重复注入全量 LLM Wiki。
+
+Prompt 大小估算：
+
+| 阶段 | 字符数 | 粗略token估算 |
+| --- | ---: | ---: |
+{prompt_size_rows}
+
+模型返回用量：
 
 | 阶段 | prompt_tokens | completion_tokens | total_tokens |
 | --- | ---: | ---: | ---: |
@@ -673,70 +790,6 @@ LLM Wiki维护命令:: 否
     print(f"中间产物目录: {output_rel_dir}")
     print("质量门结果: 已生成质量门检查表，详见审查报告和运行记录")
     return 0
-
-
-def build_prompt(agent_dir: Path, target: str, output_root: str = "outputs") -> str:
-    category = "由文件画像和知识路由自动判定"
-    review_date = datetime.now(ZoneInfo("Asia/Shanghai")).strftime("%Y-%m-%d")
-    system_prompt = read_text(agent_dir / "prompts/system.md")
-    task_prompt = read_text(agent_dir / "prompts/review.md")
-    run_record_prompt = read_text(agent_dir / "prompts/run-record.md")
-    quality_prompt = read_text(agent_dir / "prompts/quality-check.md")
-    manifest = read_text(agent_dir / "manifests/review.yaml")
-
-    task_prompt = task_prompt.replace("{{FILE_PATH}}", target)
-    task_prompt = task_prompt.replace("{{CATEGORY}}", category)
-    task_prompt = task_prompt.replace("{{REVIEW_DATE}}", review_date)
-    task_prompt = task_prompt.replace(
-        "{{WORKSPACE}}", "本项目文件和 config/hegui.yaml 中 wiki_home 指向的只读 LLM Wiki"
-    )
-    task_prompt = task_prompt.replace("{{OUTPUT_ROOT}}", output_root)
-    system_prompt = system_prompt.replace("{{REVIEW_DATE}}", review_date)
-
-    return f"""{system_prompt}
-
----
-
-{task_prompt}
-
----
-
-{run_record_prompt}
-
----
-
-{quality_prompt}
-
----
-
-# 执行 Manifest
-
-```yaml
-{manifest}
-```
-
----
-
-# 本次任务
-
-请审查文件：`{target}`
-文件分类：`{category}`
-本次输出目录：`{output_root}`
-
-请严格按上述协议执行。所有产物必须写入本次输出目录，不得写入本次输出目录之外，也不得覆盖历史报告。报告和运行记录中不得出现绝对路径。完成后只汇报审查报告路径、运行记录路径、风险点数量、是否使用外部标注、是否修改 LLM Wiki、是否对 LLM Wiki 运行维护命令。
-"""
-
-
-def runtime_env(runtime_home: Path, codex_home: Path) -> dict[str, str]:
-    env = os.environ.copy()
-    env["HOME"] = str(runtime_home)
-    env["CODEX_HOME"] = str(codex_home)
-
-    # macOS may not provide C.UTF-8; force a locale known to exist on the target dev machines.
-    for key in ("LC_ALL", "LC_CTYPE", "LANG"):
-        if env.get(key) in (None, "", "C", "C.UTF-8"):
-            env[key] = "zh_CN.UTF-8"
-    return env
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
@@ -776,15 +829,12 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv or sys.argv[1:])
     target_input = args.raw_file
 
-    agent_dir = Path(__file__).resolve().parent
-    biz_home = agent_dir.parent.parent
+    biz_home = Path(__file__).resolve().parent.parent.parent
     config_file = biz_home / "config/hegui.yaml"
     configured_wiki = read_simple_yaml_value(config_file, "wiki_home")
     wiki_home = Path(configured_wiki) if configured_wiki else biz_home.parent / "lab-hegui-llm"
     output_root = biz_home / "outputs"
-    codex_bin = biz_home / "runtime/bin/core-proxy-cli"
-    codex_home = biz_home / "runtime/config"
-    runtime_home = biz_home / "runtime/home"
+    config_dir = biz_home / "config"
 
     if not wiki_home.is_dir():
         print("wiki home not found", file=sys.stderr)
@@ -792,11 +842,8 @@ def main(argv: list[str] | None = None) -> int:
     wiki_home = wiki_home.resolve()
 
     output_root.mkdir(parents=True, exist_ok=True)
-    codex_home.mkdir(parents=True, exist_ok=True)
-    runtime_home.mkdir(parents=True, exist_ok=True)
-
-    if not codex_bin.is_file() or not os.access(codex_bin, os.X_OK):
-        print("runtime codex not found", file=sys.stderr)
+    if not (config_dir / "config.toml").is_file() or not (config_dir / "auth.json").is_file():
+        print("llm config not found: config/config.toml and config/auth.json are required", file=sys.stderr)
         return 1
 
     resolved_target = resolve_target(target_input, biz_home, wiki_home)
@@ -805,51 +852,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     target, target_path = resolved_target
 
-    if os.environ.get("HEGUI_DIRECT_CHAT") == "1":
-        return direct_chat_review(target, target_path, biz_home, wiki_home, codex_home)
-
-    category = output_category(target)
-    _, output_rel_dir = make_run_output_dir(biz_home, category, datetime.now(ZoneInfo("Asia/Shanghai")))
-    prompt = build_prompt(agent_dir, target, output_rel_dir)
-
-    before = tempfile.NamedTemporaryFile(prefix="hegui-wiki-before.", delete=False)
-    after = tempfile.NamedTemporaryFile(prefix="hegui-wiki-after.", delete=False)
-    before_path = Path(before.name)
-    after_path = Path(after.name)
-    before.close()
-    after.close()
-
-    try:
-        snapshot_tree(wiki_home, before_path)
-        result = subprocess.run(
-            [
-                str(codex_bin),
-                "exec",
-                "-C",
-                str(biz_home),
-                "--skip-git-repo-check",
-                "--ignore-rules",
-                "-s",
-                "workspace-write",
-                "-",
-            ],
-            input=prompt,
-            text=True,
-            encoding="utf-8",
-            env=runtime_env(runtime_home, codex_home),
-        )
-        if result.returncode != 0:
-            print(f"review runtime failed with exit code {result.returncode}", file=sys.stderr)
-            return result.returncode
-        snapshot_tree(wiki_home, after_path)
-        if before_path.read_bytes() != after_path.read_bytes():
-            print("error: LLM Wiki changed during review; outputs are not trusted", file=sys.stderr)
-            return 1
-    finally:
-        before_path.unlink(missing_ok=True)
-        after_path.unlink(missing_ok=True)
-
-    return 0
+    return direct_chat_review(target, target_path, biz_home, wiki_home, config_dir)
 
 
 if __name__ == "__main__":
