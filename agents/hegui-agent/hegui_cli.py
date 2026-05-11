@@ -4,15 +4,20 @@
 from __future__ import annotations
 
 import argparse
+import html
 import json
+import os
 import re
 import subprocess
 import sys
 import urllib.error
 import urllib.request
+import zipfile
 from datetime import datetime
 from pathlib import Path
+from xml.etree import ElementTree
 from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfoNotFoundError
 
 
 def read_simple_yaml_value(path: Path, key: str) -> str | None:
@@ -48,28 +53,58 @@ def read_toml_string(path: Path, key: str) -> str:
     return ""
 
 
+def local_now() -> datetime:
+    try:
+        return datetime.now(ZoneInfo("Asia/Shanghai"))
+    except ZoneInfoNotFoundError:
+        return datetime.now().astimezone()
+
+
+def extract_docx_text(target_path: Path) -> str:
+    namespaces = {
+        "w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main",
+    }
+    paragraphs: list[str] = []
+    with zipfile.ZipFile(target_path) as docx:
+        document_xml = docx.read("word/document.xml")
+    root = ElementTree.fromstring(document_xml)
+    for paragraph in root.findall(".//w:p", namespaces):
+        parts: list[str] = []
+        for node in paragraph.iter():
+            tag = node.tag.rsplit("}", 1)[-1]
+            if tag == "t" and node.text:
+                parts.append(node.text)
+            elif tag == "tab":
+                parts.append("\t")
+            elif tag == "br":
+                parts.append("\n")
+        text = html.unescape("".join(parts)).strip()
+        if text:
+            paragraphs.append(text)
+    return "\n".join(paragraphs)
+
+
 def extract_file_text(target_path: Path) -> str:
     suffix = target_path.suffix.lower()
     if suffix == ".pdf":
-        result = subprocess.run(
-            ["pdftotext", str(target_path), "-"],
-            check=True,
-            text=True,
-            encoding="utf-8",
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
+        try:
+            result = subprocess.run(
+                ["pdftotext", str(target_path), "-"],
+                check=True,
+                text=True,
+                encoding="utf-8",
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+        except FileNotFoundError as exc:
+            raise RuntimeError("PDF text extraction requires `pdftotext` in PATH.") from exc
+        except subprocess.CalledProcessError as exc:
+            raise RuntimeError(f"PDF text extraction failed: {exc.stderr.strip()}") from exc
         return result.stdout
-    if suffix in {".doc", ".docx"}:
-        result = subprocess.run(
-            ["textutil", "-convert", "txt", "-stdout", str(target_path)],
-            check=True,
-            text=True,
-            encoding="utf-8",
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        return result.stdout
+    if suffix == ".docx":
+        return extract_docx_text(target_path)
+    if suffix == ".doc":
+        raise RuntimeError("Legacy .doc is not supported cross-platform. Please convert it to .docx first.")
     if suffix in {".txt", ".md"}:
         return target_path.read_text(encoding="utf-8")
     raise ValueError(f"unsupported file type: {suffix}")
@@ -321,6 +356,10 @@ def post_chat_completion(base_url: str, api_key: str, model: str, prompt: str, m
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", "replace")
         raise RuntimeError(f"chat completion failed: {exc.code} {detail}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"chat completion connection failed: {exc.reason}") from exc
+    except TimeoutError as exc:
+        raise RuntimeError("chat completion timed out") from exc
 
 
 def direct_chat_review(
@@ -338,7 +377,7 @@ def direct_chat_review(
         print("direct chat config incomplete", file=sys.stderr)
         return 1
 
-    now = datetime.now(ZoneInfo("Asia/Shanghai"))
+    now = local_now()
     review_date = now.strftime("%Y-%m-%d")
     review_time = now.strftime("%H:%M:%S CST")
     category = output_category(target)
@@ -832,7 +871,10 @@ def main(argv: list[str] | None = None) -> int:
     biz_home = Path(__file__).resolve().parent.parent.parent
     config_file = biz_home / "config/hegui.yaml"
     configured_wiki = read_simple_yaml_value(config_file, "wiki_home")
-    wiki_home = Path(configured_wiki) if configured_wiki else biz_home.parent / "lab-hegui-llm"
+    wiki_setting = os.environ.get("HEGUI_WIKI_HOME") or configured_wiki
+    wiki_home = Path(wiki_setting) if wiki_setting else biz_home.parent / "lab-hegui-llm"
+    if not wiki_home.is_absolute():
+        wiki_home = (biz_home / wiki_home).resolve()
     output_root = biz_home / "outputs"
     config_dir = biz_home / "config"
 
@@ -856,4 +898,11 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        print("interrupted", file=sys.stderr)
+        raise SystemExit(130)
+    except Exception as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        raise SystemExit(1)

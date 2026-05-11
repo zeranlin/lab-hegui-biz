@@ -7,10 +7,12 @@
 ## 使用方式
 
 ```bash
-agents/hegui-agent/hegui_cli.py '<待审查文件相对路径>'
+python agents/hegui-agent/hegui_cli.py '<待审查文件相对路径>'
 ```
 
 待审查文件可以使用本项目内相对路径，也可以使用本项目内文件的绝对路径。文件画像、品类路由和专项动作由 LLM Wiki 审查协议决定。
+
+Windows 下请使用 `python` 显式启动脚本。默认要求 `lab-hegui-biz` 和 `lab-hegui-llm` 位于同一上级目录；如知识库在其他位置，可以设置 `HEGUI_WIKI_HOME`。
 
 ## 运行时
 

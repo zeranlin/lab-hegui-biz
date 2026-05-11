@@ -17,10 +17,12 @@ config/auth.json         # 本地鉴权配置
 ## 审查
 
 ```bash
-agents/hegui-agent/hegui_cli.py '<待审查文件相对路径>'
+python agents/hegui-agent/hegui_cli.py '<待审查文件相对路径>'
 ```
 
 入口只接收待审查文件，文件画像、品类路由和专项动作由 LLM Wiki 审查协议决定。
+
+默认要求 `lab-hegui-biz` 和 `lab-hegui-llm` 位于同一上级目录。如果知识库不在默认位置，可以设置 `HEGUI_WIKI_HOME` 指向只读 LLM Wiki。
 
 ## 产物
 
