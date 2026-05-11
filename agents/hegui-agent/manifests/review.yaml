@@ -1,0 +1,74 @@
+name: review
+version: 0.1
+description: 政府采购招标文件合规审查生产线协议
+
+category: 由文件画像和知识路由自动判定
+
+inputs:
+  required:
+    - file_path
+    - category
+
+knowledge:
+  required_pages:
+    - AGENTS.md
+    - wiki/index.md
+    - wiki/00-入口/外部执行主体招标文件审查指引.md
+    - wiki/70-审查协议/知识驱动审查执行规范.md
+    - wiki/70-审查协议/政府采购招标文件业务审查流水线.md
+    - wiki/70-审查协议/政府采购招标文件审查协议.md
+    - wiki/20-知识点/知识分层与路由规则.md
+    - wiki/20-知识点/政府采购招标文件画像.md
+    - wiki/20-知识点/政府采购逐章审查矩阵.md
+    - wiki/20-知识点/物业管理动作化审查包.md
+    - wiki/70-审查协议/物业管理审查动作协议.md
+    - wiki/70-审查协议/风险原子化规则.md
+    - wiki/70-审查协议/质量门规则.md
+    - wiki/15-行业基础/物业管理服务采购背景.md
+    - wiki/15-行业基础/政府采购专项场景画像.md
+    - wiki/25-风险审查点/风险审查点总览.md
+    - wiki/90-模板/审查记录模板.md
+    - wiki/90-模板/AI调度运行记录模板.md
+
+steps:
+  - id: boundary
+    name: 确认执行边界
+  - id: ingest
+    name: 读取招标文件并准备临时抽取文本
+  - id: profile
+    name: 生成文件画像
+  - id: route
+    name: 调用知识路由、外部执行主体指引和物业动作协议
+  - id: action_list
+    name: 生成 PROP-A01 至 PROP-A23 动作清单
+  - id: chapter_action_review
+    name: 逐章逐动作审查
+  - id: atomize
+    name: 按风险原子化规则拆分风险
+  - id: risk_match
+    name: 匹配风险审查点和动作ID
+  - id: quality_gate
+    name: 执行质量门和二次反查
+  - id: review_record
+    name: 生成审查报告
+  - id: run_record
+    name: 生成 AI 调度运行记录
+  - id: self_check
+    name: 审查产物自检
+
+outputs:
+  review_report: outputs/物业管理/
+  run_record: outputs/物业管理/
+
+guards:
+  forbid_external_annotations: true
+  forbid_raw_source_edits: true
+  forbid_wiki_edits: true
+  forbid_knowledge_feedback: true
+  forbid_wiki_maintenance_commands: true
+  require_original_text_for_each_risk: true
+  require_action_id_for_each_risk: true
+  require_prop_actions_a01_to_a23: true
+  require_quality_gate: true
+  forbid_risk_over_merge: true
+  require_run_record: true

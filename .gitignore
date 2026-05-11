@@ -1,0 +1,25 @@
+.DS_Store
+__pycache__/
+*.pyc
+*.tmp
+*.log
+dist/
+
+# Local runtime secrets and Codex state. Keep examples only.
+runtime/bin/core-proxy-cli
+runtime/config/auth.json
+runtime/config/config.toml
+runtime/config/*.sqlite
+runtime/config/*.sqlite-*
+runtime/config/*.sqlite-shm
+runtime/config/*.sqlite-wal
+runtime/config/history.jsonl
+runtime/config/installation_id
+runtime/config/sessions/
+runtime/config/log/
+runtime/config/tmp/
+runtime/config/.tmp/
+runtime/config/memories/
+runtime/config/shell_snapshots/
+runtime/config/skills/
+runtime/home/

@@ -1,0 +1,26 @@
+agent:
+  name: hegui-agent
+  mode: python-codex-runner
+  wiki_home: /path/to/lab-hegui-llm
+  # 隔离环境推荐把 Codex CLI 可执行文件放在项目 runtime 内。
+  codex_bin: runtime/bin/core-proxy-cli
+  # 隔离环境必须使用独立 CODEX_HOME，避免读取使用者本机 ~/.codex。
+  codex_home: runtime/config
+
+model:
+  # 推荐在 runtime/config/config.toml 中设置真实 provider/model。
+  provider: openai-compatible
+  model: gpt-5.5
+  base_url: https://example.com/v1
+  api_key_env: OPENAI_API_KEY
+
+review:
+  require_run_record: true
+  forbid_external_annotations: true
+  forbid_raw_source_edits: true
+  forbid_wiki_edits: true
+  forbid_wiki_maintenance_commands: true
+
+paths:
+  raw_root: raw/招标文件
+  output_root: outputs

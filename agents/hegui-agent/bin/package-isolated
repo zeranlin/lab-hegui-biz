@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+WORKSPACE="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
+OUT="${1:-${WORKSPACE}/dist/lab-hegui-biz-isolated.tar.gz}"
+TMP_OUT="$(mktemp "/tmp/lab-hegui-biz-isolated.XXXXXX.tar.gz")"
+
+cd "${WORKSPACE}"
+
+if [[ ! -x "runtime/bin/core-proxy-cli" ]]; then
+  echo "missing runtime/bin/core-proxy-cli" >&2
+  echo "run runtime/bin/core-proxy-cli --version after installing runtime" >&2
+  exit 1
+fi
+
+mkdir -p "$(dirname "${OUT}")"
+
+tar \
+  --exclude=".git" \
+  --exclude=".DS_Store" \
+  -czf "${TMP_OUT}" \
+  .
+
+mv "${TMP_OUT}" "${OUT}"
+echo "isolated package: ${OUT}"
