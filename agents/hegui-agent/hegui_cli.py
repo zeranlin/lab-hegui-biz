@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import html
 import json
 import os
@@ -236,6 +237,24 @@ def estimate_tokens(text: str) -> int:
     return round(len(text) / 1.5)
 
 
+def text_hash(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
+
+
+def usage_number(usage: dict, key: str) -> int:
+    value = usage.get(key)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.isdigit():
+        return int(value)
+    return 0
+
+
+def output_hit_limit(usage: dict, max_tokens: int) -> bool:
+    completion_tokens = usage_number(usage, "completion_tokens")
+    return completion_tokens >= max(1, int(max_tokens * 0.98))
+
+
 def budget_wiki_pages(wiki_home: Path, pages: list[str], char_budget: int) -> tuple[str, list[str]]:
     chunks: list[str] = []
     loaded: list[str] = []
@@ -329,6 +348,51 @@ def chat_text(base_url: str, api_key: str, model: str, prompt: str, max_tokens: 
     return str(message.get("content") or "").strip(), chat.get("usage") or {}
 
 
+def chat_stage(
+    base_url: str,
+    api_key: str,
+    model: str,
+    stage_name: str,
+    prompt: str,
+    max_tokens: int,
+    attempt_rows: list[dict[str, str | int | bool]],
+    max_retries: int = 1,
+) -> tuple[str, dict]:
+    current_prompt = prompt
+    current_max_tokens = max_tokens
+    for attempt in range(1, max_retries + 2):
+        content, usage = chat_text(base_url, api_key, model, current_prompt, max_tokens=current_max_tokens)
+        hit_limit = output_hit_limit(usage, current_max_tokens)
+        attempt_rows.append(
+            {
+                "stage": stage_name,
+                "attempt": attempt,
+                "max_tokens": current_max_tokens,
+                "prompt_hash": text_hash(current_prompt),
+                "output_hash": text_hash(content),
+                "prompt_tokens": usage_number(usage, "prompt_tokens"),
+                "completion_tokens": usage_number(usage, "completion_tokens"),
+                "total_tokens": usage_number(usage, "total_tokens"),
+                "hit_limit": hit_limit,
+            }
+        )
+        if content and not hit_limit:
+            return content, usage
+        if attempt > max_retries:
+            if not content:
+                raise RuntimeError(f"{stage_name} returned empty content")
+            raise RuntimeError(f"{stage_name} output reached max_tokens limit; stage result is not trusted")
+        current_max_tokens = min(current_max_tokens * 2, 24000)
+        current_prompt = f"""{prompt}
+
+## 重试要求
+
+上一轮 `{stage_name}` 输出疑似为空或触达 max_tokens 上限。本轮必须输出完整中间产物。
+不得省略必填字段；如内容较多，应优先保留结构化字段、动作状态、原文证据和质量门结论。
+"""
+    raise RuntimeError(f"{stage_name} failed")
+
+
 def post_chat_completion(base_url: str, api_key: str, model: str, prompt: str, max_tokens: int = 16000) -> dict:
     payload = {
         "model": model,
@@ -409,6 +473,7 @@ def direct_chat_review(
 
     usages: list[tuple[str, dict]] = []
     prompt_stats: list[tuple[str, int, int]] = []
+    attempt_rows: list[dict[str, str | int | bool]] = []
     stage_paths = [
         ("01-文件画像", profile_rel),
         ("02-知识路由表", route_rel),
@@ -468,7 +533,15 @@ def direct_chat_review(
 必须满足入口指引中 `01-文件画像` 的字段和通过条件；未见字段写 `未见`，不确定字段写 `待确认`。
 """
     prompt_stats.append(("01-文件画像", len(profile_prompt), estimate_tokens(profile_prompt)))
-    profile, usage = chat_text(base_url, api_key, model, profile_prompt, max_tokens=1000)
+    profile, usage = chat_stage(
+        base_url,
+        api_key,
+        model,
+        "01-文件画像",
+        profile_prompt,
+        max_tokens=6000,
+        attempt_rows=attempt_rows,
+    )
     usages.append(("01-文件画像", usage))
     stage_file(profile_path, "01-文件画像", profile)
 
@@ -516,7 +589,15 @@ def direct_chat_review(
 每个知识页请尽量使用相对于 LLM Wiki 的稳定路径。
 """
     prompt_stats.append(("02-知识路由表", len(route_prompt), estimate_tokens(route_prompt)))
-    route, usage = chat_text(base_url, api_key, model, route_prompt, max_tokens=6000)
+    route, usage = chat_stage(
+        base_url,
+        api_key,
+        model,
+        "02-知识路由表",
+        route_prompt,
+        max_tokens=8000,
+        attempt_rows=attempt_rows,
+    )
     usages.append(("02-知识路由表", usage))
     stage_file(route_path, "02-知识路由表", route)
 
@@ -552,7 +633,15 @@ def direct_chat_review(
 动作必须来自知识路由结果、逐章矩阵、通用审查协议和命中的品类动作协议。
 """
     prompt_stats.append(("03-动作清单", len(actions_prompt), estimate_tokens(actions_prompt)))
-    actions, usage = chat_text(base_url, api_key, model, actions_prompt, max_tokens=8000)
+    actions, usage = chat_stage(
+        base_url,
+        api_key,
+        model,
+        "03-动作清单",
+        actions_prompt,
+        max_tokens=10000,
+        attempt_rows=attempt_rows,
+    )
     usages.append(("03-动作清单", usage))
     stage_file(actions_path, "03-动作清单", actions)
 
@@ -590,7 +679,15 @@ def direct_chat_review(
 每个动作都必须有状态、读取范围、原文位置或未命中原因；命中和待确认动作必须形成候选风险或说明待确认原因。
 """
     prompt_stats.append(("04-动作执行记录", len(action_exec_prompt), estimate_tokens(action_exec_prompt)))
-    action_exec, usage = chat_text(base_url, api_key, model, action_exec_prompt, max_tokens=14000)
+    action_exec, usage = chat_stage(
+        base_url,
+        api_key,
+        model,
+        "04-动作执行记录",
+        action_exec_prompt,
+        max_tokens=16000,
+        attempt_rows=attempt_rows,
+    )
     usages.append(("04-动作执行记录", usage))
     stage_file(action_exec_path, "04-动作执行记录", action_exec)
 
@@ -620,7 +717,15 @@ def direct_chat_review(
 必须按 LLM Wiki 风险原子化规则拆分候选风险；每个风险必须能反链来源动作和关联审查点。
 """
     prompt_stats.append(("05-原子风险清单", len(atomized_prompt), estimate_tokens(atomized_prompt)))
-    atomized, usage = chat_text(base_url, api_key, model, atomized_prompt, max_tokens=12000)
+    atomized, usage = chat_stage(
+        base_url,
+        api_key,
+        model,
+        "05-原子风险清单",
+        atomized_prompt,
+        max_tokens=14000,
+        attempt_rows=attempt_rows,
+    )
     usages.append(("05-原子风险清单", usage))
     stage_file(atomized_path, "05-原子风险清单", atomized)
 
@@ -653,7 +758,15 @@ def direct_chat_review(
 必须检查入口指引列出的最低质量门；如风险数量偏低，必须执行异常低风险数量反查并记录反查范围和结论。
 """
     prompt_stats.append(("06-质量门检查表", len(quality_prompt), estimate_tokens(quality_prompt)))
-    quality, usage = chat_text(base_url, api_key, model, quality_prompt, max_tokens=8000)
+    quality, usage = chat_stage(
+        base_url,
+        api_key,
+        model,
+        "06-质量门检查表",
+        quality_prompt,
+        max_tokens=10000,
+        attempt_rows=attempt_rows,
+    )
     usages.append(("06-质量门检查表", usage))
     stage_file(quality_path, "06-质量门检查表", quality)
 
@@ -726,7 +839,15 @@ LLM Wiki维护命令:: 否
 不得出现绝对路径。
 """
     prompt_stats.append(("07-AI审查记录", len(report_prompt), estimate_tokens(report_prompt)))
-    report, usage = chat_text(base_url, api_key, model, report_prompt, max_tokens=16000)
+    report, usage = chat_stage(
+        base_url,
+        api_key,
+        model,
+        "07-AI审查记录",
+        report_prompt,
+        max_tokens=18000,
+        attempt_rows=attempt_rows,
+    )
     usages.append(("07-AI审查记录", usage))
     if not report:
         print("pipeline returned empty report", file=sys.stderr)
@@ -740,6 +861,12 @@ LLM Wiki维护命令:: 否
         for name, usage in usages
     )
     prompt_size_rows = "\n".join(f"| {name} | {chars} | {tokens} |" for name, chars, tokens in prompt_stats)
+    attempt_detail_rows = "\n".join(
+        "| {stage} | {attempt} | {max_tokens} | {prompt_hash} | {output_hash} | {prompt_tokens} | {completion_tokens} | {total_tokens} | {hit_limit} |".format(
+            **row
+        )
+        for row in attempt_rows
+    )
     stage_rows = "\n".join(f"| {name} | {path} |" for name, path in stage_paths)
     knowledge_pages = [*profile_pages, *route_pages, *action_pages, *review_pages]
     knowledge_rows = "\n".join(f"- {page}" for page in dict.fromkeys(knowledge_pages))
@@ -809,6 +936,12 @@ Prompt 大小估算：
 | 阶段 | prompt_tokens | completion_tokens | total_tokens |
 | --- | ---: | ---: | ---: |
 {usage_rows}
+
+阶段调用复现信息：
+
+| 阶段 | 尝试 | max_tokens | prompt_hash | output_hash | prompt_tokens | completion_tokens | total_tokens | 是否触达上限 |
+| --- | ---: | ---: | --- | --- | ---: | ---: | ---: | --- |
+{attempt_detail_rows}
 
 ## 6. 质量门结果
 
