@@ -16,6 +16,7 @@ import urllib.request
 import zipfile
 from datetime import datetime
 from pathlib import Path
+from typing import Callable
 from xml.etree import ElementTree
 from zoneinfo import ZoneInfo
 from zoneinfo import ZoneInfoNotFoundError
@@ -241,6 +242,118 @@ def text_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
 
 
+def extract_numbered_section(text: str, section_number: str) -> str:
+    pattern = re.compile(
+        rf"^##\s+{re.escape(section_number)}\.\s.*?(?=^##\s+\d+\.|\Z)",
+        flags=re.MULTILINE | re.DOTALL,
+    )
+    match = pattern.search(text)
+    return match.group(0) if match else ""
+
+
+def extract_required_fields(entry_guide: str, artifact_name: str) -> list[str]:
+    pattern = re.compile(
+        rf"`{re.escape(artifact_name)}`\s*至少包含：\s*```text\s*(.*?)\s*```",
+        flags=re.DOTALL,
+    )
+    match = pattern.search(entry_guide)
+    if not match:
+        return []
+    fields: list[str] = []
+    for line in match.group(1).splitlines():
+        field = line.strip()
+        if not field:
+            continue
+        field = re.split(r"[：:]", field, maxsplit=1)[0].strip()
+        if field:
+            fields.append(field)
+    return fields
+
+
+def extract_section_wiki_refs(entry_guide: str, section_number: str) -> list[str]:
+    return extract_wiki_refs(extract_numbered_section(entry_guide, section_number))
+
+
+def extract_conditional_route_refs(entry_guide: str) -> list[tuple[str, list[str]]]:
+    section = extract_numbered_section(entry_guide, "5")
+    requirements: list[tuple[str, list[str]]] = []
+    for match in re.finditer(
+        r"如果画像命中(.+?)，必须额外路由：\s*(.*?)(?=\n###|\Z)",
+        section,
+        flags=re.DOTALL,
+    ):
+        requirements.append((match.group(1).strip(), extract_wiki_refs(match.group(2))))
+    return requirements
+
+
+def expand_action_range(start_id: str, end_id: str) -> list[str]:
+    start_match = re.match(r"^([A-Za-z-]+)(\d+)$", start_id)
+    end_match = re.match(r"^([A-Za-z-]+)(\d+)$", end_id)
+    if not start_match or not end_match or start_match.group(1) != end_match.group(1):
+        return [start_id, end_id]
+    prefix = start_match.group(1)
+    start_number = int(start_match.group(2))
+    end_number = int(end_match.group(2))
+    width = max(len(start_match.group(2)), len(end_match.group(2)))
+    if end_number < start_number:
+        return [start_id, end_id]
+    return [f"{prefix}{number:0{width}d}" for number in range(start_number, end_number + 1)]
+
+
+def extract_conditional_action_ids(entry_guide: str) -> list[tuple[str, list[str]]]:
+    section = extract_numbered_section(entry_guide, "6")
+    requirements: list[tuple[str, list[str]]] = []
+    for match in re.finditer(
+        r"如果文件画像命中(.+?)，必须生成并执行\s*`([^`]+)`\s*至\s*`([^`]+)`",
+        section,
+    ):
+        requirements.append((match.group(1).strip(), expand_action_range(match.group(2), match.group(3))))
+    return requirements
+
+
+def normalize_condition_term(term: str) -> str:
+    return term.strip(" ：:，,。；;")
+
+
+def condition_hit(profile: str, term: str) -> bool:
+    normalized = normalize_condition_term(term)
+    return bool(normalized and normalized in profile)
+
+
+def wiki_ref_present(content: str, ref: str) -> bool:
+    candidates = {ref}
+    if ref.endswith(".md"):
+        candidates.add(ref[:-3])
+    else:
+        candidates.add(f"{ref}.md")
+    return any(candidate in content for candidate in candidates)
+
+
+def validate_wiki_protocol_output(
+    stage_name: str,
+    content: str,
+    required_fields: list[str],
+    required_refs: list[str] | None = None,
+    required_action_ids: list[str] | None = None,
+) -> list[str]:
+    issues: list[str] = []
+    missing_fields = [field for field in required_fields if field not in content]
+    if missing_fields:
+        issues.append("缺少 Wiki 协议必填字段：" + "、".join(missing_fields))
+
+    missing_refs = [ref for ref in (required_refs or []) if not wiki_ref_present(content, ref)]
+    if missing_refs:
+        issues.append("缺少 Wiki 协议要求路由的知识页：" + "、".join(missing_refs))
+
+    missing_actions = [action_id for action_id in (required_action_ids or []) if action_id not in content]
+    if missing_actions:
+        issues.append("缺少 Wiki 协议要求的动作ID：" + "、".join(missing_actions))
+
+    if issues:
+        issues.insert(0, f"{stage_name} 未通过 LLM Wiki 协议结构校验")
+    return issues
+
+
 def usage_number(usage: dict, key: str) -> int:
     value = usage.get(key)
     if isinstance(value, int):
@@ -342,6 +455,25 @@ def stage_file(path: Path, title: str, content: str) -> None:
     path.write_text(f"# {title}\n\n{content.rstrip()}\n", encoding="utf-8")
 
 
+PROMPT_OUTPUT_DIR = "outputs/<CATEGORY>/<RUN_ID>"
+PROMPT_EXTRACT_REL = f"{PROMPT_OUTPUT_DIR}/<PROJECT>-抽取文本.txt"
+PROMPT_PROFILE_REL = f"{PROMPT_OUTPUT_DIR}/<PROJECT>-01-文件画像.md"
+PROMPT_ROUTE_REL = f"{PROMPT_OUTPUT_DIR}/<PROJECT>-02-知识路由表.md"
+PROMPT_ACTIONS_REL = f"{PROMPT_OUTPUT_DIR}/<PROJECT>-03-动作清单.md"
+PROMPT_ACTION_EXEC_REL = f"{PROMPT_OUTPUT_DIR}/<PROJECT>-04-动作执行记录.md"
+PROMPT_ATOMIZED_REL = f"{PROMPT_OUTPUT_DIR}/<PROJECT>-05-原子风险清单.md"
+PROMPT_QUALITY_REL = f"{PROMPT_OUTPUT_DIR}/<PROJECT>-06-质量门检查表.md"
+PROMPT_RUN_REL = f"{PROMPT_OUTPUT_DIR}/<PROJECT>-AI调度运行记录.md"
+PROMPT_REVIEW_DATE = "<REVIEW_DATE>"
+PROMPT_REVIEW_TIME = "<REVIEW_TIME>"
+
+
+def replace_prompt_placeholders(text: str, replacements: dict[str, str]) -> str:
+    for placeholder, value in sorted(replacements.items(), key=lambda item: len(item[0]), reverse=True):
+        text = text.replace(placeholder, value)
+    return text
+
+
 def chat_text(base_url: str, api_key: str, model: str, prompt: str, max_tokens: int = 8000) -> tuple[str, dict]:
     chat = post_chat_completion(base_url, api_key, model, prompt, max_tokens=max_tokens)
     message = (chat.get("choices") or [{}])[0].get("message") or {}
@@ -357,12 +489,16 @@ def chat_stage(
     max_tokens: int,
     attempt_rows: list[dict[str, str | int | bool]],
     max_retries: int = 1,
+    validator: Callable[[str], list[str]] | None = None,
 ) -> tuple[str, dict]:
     current_prompt = prompt
     current_max_tokens = max_tokens
+    last_issues: list[str] = []
     for attempt in range(1, max_retries + 2):
         content, usage = chat_text(base_url, api_key, model, current_prompt, max_tokens=current_max_tokens)
         hit_limit = output_hit_limit(usage, current_max_tokens)
+        validation_issues = validator(content) if content and validator else []
+        last_issues = validation_issues
         attempt_rows.append(
             {
                 "stage": stage_name,
@@ -374,23 +510,31 @@ def chat_stage(
                 "completion_tokens": usage_number(usage, "completion_tokens"),
                 "total_tokens": usage_number(usage, "total_tokens"),
                 "hit_limit": hit_limit,
+                "protocol_ok": bool(content and not validation_issues),
             }
         )
-        if content and not hit_limit:
+        if content and not hit_limit and not validation_issues:
             return content, usage
         if attempt > max_retries:
             if not content:
                 raise RuntimeError(f"{stage_name} returned empty content")
+            if validation_issues:
+                raise RuntimeError(f"{stage_name} failed Wiki protocol check: {'; '.join(validation_issues)}")
             raise RuntimeError(f"{stage_name} output reached max_tokens limit; stage result is not trusted")
         current_max_tokens = min(current_max_tokens * 2, 24000)
+        issue_text = "\n".join(f"- {issue}" for issue in validation_issues)
+        retry_reason = issue_text or f"- `{stage_name}` 输出疑似为空或触达 max_tokens 上限。"
         current_prompt = f"""{prompt}
 
 ## 重试要求
 
-上一轮 `{stage_name}` 输出疑似为空或触达 max_tokens 上限。本轮必须输出完整中间产物。
+上一轮未通过，原因：
+{retry_reason}
+
+本轮必须严格按 LLM Wiki 协议输出完整中间产物。
 不得省略必填字段；如内容较多，应优先保留结构化字段、动作状态、原文证据和质量门结论。
 """
-    raise RuntimeError(f"{stage_name} failed")
+    raise RuntimeError(f"{stage_name} failed: {'; '.join(last_issues)}")
 
 
 def post_chat_completion(base_url: str, api_key: str, model: str, prompt: str, max_tokens: int = 16000) -> dict:
@@ -466,6 +610,19 @@ def direct_chat_review(
     quality_path = biz_home / quality_rel
     report_path = biz_home / report_rel
     run_path = biz_home / run_rel
+    report_replacements = {
+        PROMPT_OUTPUT_DIR: output_rel_dir,
+        PROMPT_EXTRACT_REL: extract_rel,
+        PROMPT_PROFILE_REL: profile_rel,
+        PROMPT_ROUTE_REL: route_rel,
+        PROMPT_ACTIONS_REL: actions_rel,
+        PROMPT_ACTION_EXEC_REL: action_exec_rel,
+        PROMPT_ATOMIZED_REL: atomized_rel,
+        PROMPT_QUALITY_REL: quality_rel,
+        PROMPT_RUN_REL: run_rel,
+        PROMPT_REVIEW_DATE: review_date,
+        PROMPT_REVIEW_TIME: review_time,
+    }
 
     raw_text = extract_file_text(target_path)
     numbered_text = line_number_text(raw_text)
@@ -485,6 +642,28 @@ def direct_chat_review(
         ("08-运行记录", run_rel),
     ]
 
+    entry_guide_text = read_wiki_page(wiki_home, ENTRY_GUIDE)
+    protocol_fields = {
+        "01-文件画像": extract_required_fields(entry_guide_text, "01-文件画像"),
+        "02-知识路由表": extract_required_fields(entry_guide_text, "02-知识路由表"),
+        "03-动作清单": extract_required_fields(entry_guide_text, "03-动作清单"),
+        "04-动作执行记录": extract_required_fields(entry_guide_text, "04-动作执行记录"),
+        "05-原子风险清单": extract_required_fields(entry_guide_text, "05-原子风险清单"),
+        "06-质量门检查表": extract_required_fields(entry_guide_text, "06-质量门检查表"),
+    }
+    conditional_route_refs = extract_conditional_route_refs(entry_guide_text)
+    conditional_route_ref_set = {
+        ref
+        for _, refs in conditional_route_refs
+        for ref in refs
+    }
+    base_route_refs = [
+        ref
+        for ref in extract_section_wiki_refs(entry_guide_text, "5")
+        if ref not in conditional_route_ref_set
+    ]
+    conditional_action_ids = extract_conditional_action_ids(entry_guide_text)
+
     core_knowledge, core_pages = budget_wiki_pages(wiki_home, CORE_EXECUTION_PAGES, char_budget=52000)
 
     shared_context = f"""你是政府采购招标文件合规审查生产线的外部执行主体。
@@ -501,8 +680,8 @@ def direct_chat_review(
 
 本次文件位置：
 - 原始文件：{target}
-- 抽取文本：{extract_rel}
-- 输出目录：{output_rel_dir}
+- 抽取文本：{PROMPT_EXTRACT_REL}
+- 输出目录：{PROMPT_OUTPUT_DIR}
 
 本阶段核心 LLM Wiki 知识：
 {core_knowledge}
@@ -518,8 +697,8 @@ def direct_chat_review(
 
 本次文件位置：
 - 原始文件：{target}
-- 抽取文本：{extract_rel}
-- 输出目录：{output_rel_dir}
+- 抽取文本：{PROMPT_EXTRACT_REL}
+- 输出目录：{PROMPT_OUTPUT_DIR}
 
 画像阶段 LLM Wiki 知识：
 {profile_knowledge}
@@ -541,6 +720,11 @@ def direct_chat_review(
         profile_prompt,
         max_tokens=6000,
         attempt_rows=attempt_rows,
+        validator=lambda content: validate_wiki_protocol_output(
+            "01-文件画像",
+            content,
+            protocol_fields["01-文件画像"],
+        ),
     )
     usages.append(("01-文件画像", usage))
     stage_file(profile_path, "01-文件画像", profile)
@@ -564,6 +748,10 @@ def direct_chat_review(
 
 {law_catalog(wiki_home)}
 """
+    active_route_refs = list(base_route_refs)
+    for term, refs in conditional_route_refs:
+        if condition_hit(profile, term):
+            active_route_refs.extend(refs)
 
     route_prompt = f"""你是政府采购招标文件合规审查生产线的外部执行主体。
 
@@ -572,8 +760,8 @@ def direct_chat_review(
 
 本次文件位置：
 - 原始文件：{target}
-- 抽取文本：{extract_rel}
-- 输出目录：{output_rel_dir}
+- 抽取文本：{PROMPT_EXTRACT_REL}
+- 输出目录：{PROMPT_OUTPUT_DIR}
 
 路由阶段 LLM Wiki 知识：
 {route_knowledge}
@@ -597,6 +785,12 @@ def direct_chat_review(
         route_prompt,
         max_tokens=8000,
         attempt_rows=attempt_rows,
+        validator=lambda content: validate_wiki_protocol_output(
+            "02-知识路由表",
+            content,
+            protocol_fields["02-知识路由表"],
+            required_refs=list(dict.fromkeys(active_route_refs)),
+        ),
     )
     usages.append(("02-知识路由表", usage))
     stage_file(route_path, "02-知识路由表", route)
@@ -615,8 +809,8 @@ def direct_chat_review(
 
 本次文件位置：
 - 原始文件：{target}
-- 抽取文本：{extract_rel}
-- 输出目录：{output_rel_dir}
+- 抽取文本：{PROMPT_EXTRACT_REL}
+- 输出目录：{PROMPT_OUTPUT_DIR}
 
 动作清单阶段 LLM Wiki 知识：
 {action_knowledge}
@@ -632,6 +826,10 @@ def direct_chat_review(
 只输出 `03-动作清单` Markdown 内容。不得输出风险详情，不得生成最终报告。
 动作必须来自知识路由结果、逐章矩阵、通用审查协议和命中的品类动作协议。
 """
+    active_action_ids: list[str] = []
+    for term, action_ids in conditional_action_ids:
+        if condition_hit(profile, term):
+            active_action_ids.extend(action_ids)
     prompt_stats.append(("03-动作清单", len(actions_prompt), estimate_tokens(actions_prompt)))
     actions, usage = chat_stage(
         base_url,
@@ -641,6 +839,12 @@ def direct_chat_review(
         actions_prompt,
         max_tokens=10000,
         attempt_rows=attempt_rows,
+        validator=lambda content: validate_wiki_protocol_output(
+            "03-动作清单",
+            content,
+            protocol_fields["03-动作清单"],
+            required_action_ids=list(dict.fromkeys(active_action_ids)),
+        ),
     )
     usages.append(("03-动作清单", usage))
     stage_file(actions_path, "03-动作清单", actions)
@@ -687,6 +891,12 @@ def direct_chat_review(
         action_exec_prompt,
         max_tokens=16000,
         attempt_rows=attempt_rows,
+        validator=lambda content: validate_wiki_protocol_output(
+            "04-动作执行记录",
+            content,
+            protocol_fields["04-动作执行记录"],
+            required_action_ids=list(dict.fromkeys(active_action_ids)),
+        ),
     )
     usages.append(("04-动作执行记录", usage))
     stage_file(action_exec_path, "04-动作执行记录", action_exec)
@@ -725,6 +935,11 @@ def direct_chat_review(
         atomized_prompt,
         max_tokens=14000,
         attempt_rows=attempt_rows,
+        validator=lambda content: validate_wiki_protocol_output(
+            "05-原子风险清单",
+            content,
+            protocol_fields["05-原子风险清单"],
+        ),
     )
     usages.append(("05-原子风险清单", usage))
     stage_file(atomized_path, "05-原子风险清单", atomized)
@@ -766,6 +981,11 @@ def direct_chat_review(
         quality_prompt,
         max_tokens=10000,
         attempt_rows=attempt_rows,
+        validator=lambda content: validate_wiki_protocol_output(
+            "06-质量门检查表",
+            content,
+            protocol_fields["06-质量门检查表"],
+        ),
     )
     usages.append(("06-质量门检查表", usage))
     stage_file(quality_path, "06-质量门检查表", quality)
@@ -778,8 +998,8 @@ def direct_chat_review(
 
 本次文件位置：
 - 原始文件：{target}
-- 抽取文本：{extract_rel}
-- 输出目录：{output_rel_dir}
+- 抽取文本：{PROMPT_EXTRACT_REL}
+- 输出目录：{PROMPT_OUTPUT_DIR}
 
 文件画像：
 {profile}
@@ -804,8 +1024,8 @@ def direct_chat_review(
 报告顶部必须包含：
 类型:: 审查记录
 状态:: AI 审查版
-审查日期:: {review_date}
-审查时间:: {review_time}
+审查日期:: {PROMPT_REVIEW_DATE}
+审查时间:: {PROMPT_REVIEW_TIME}
 审查人:: AI 审查
 外部标注使用:: 否
 LLM Wiki修改:: 否
@@ -823,14 +1043,14 @@ LLM Wiki维护命令:: 否
 
 文件位置只能使用以下相对路径：
 - 原始文件：{target}
-- 抽取文本：{extract_rel}
-- 文件画像：{profile_rel}
-- 知识路由表：{route_rel}
-- 动作清单：{actions_rel}
-- 动作执行记录：{action_exec_rel}
-- 原子风险清单：{atomized_rel}
-- 质量门检查表：{quality_rel}
-- 运行记录：{run_rel}
+- 抽取文本：{PROMPT_EXTRACT_REL}
+- 文件画像：{PROMPT_PROFILE_REL}
+- 知识路由表：{PROMPT_ROUTE_REL}
+- 动作清单：{PROMPT_ACTIONS_REL}
+- 动作执行记录：{PROMPT_ACTION_EXEC_REL}
+- 原子风险清单：{PROMPT_ATOMIZED_REL}
+- 质量门检查表：{PROMPT_QUALITY_REL}
+- 运行记录：{PROMPT_RUN_REL}
 
 每条风险必须保留：结论类型、风险等级、原文位置、原文内容、问题说明、关联动作ID、关联审查点、审查依据、修改建议、是否需要人工复核。
 风险标题必须统一使用三级标题格式：### 风险 1：风险标题、### 风险 2：风险标题。
@@ -852,6 +1072,7 @@ LLM Wiki维护命令:: 否
     if not report:
         print("pipeline returned empty report", file=sys.stderr)
         return 1
+    report = replace_prompt_placeholders(report, report_replacements)
 
     report_path.write_text(report.rstrip() + "\n", encoding="utf-8")
     risk_count = count_risks(report)
@@ -862,7 +1083,7 @@ LLM Wiki维护命令:: 否
     )
     prompt_size_rows = "\n".join(f"| {name} | {chars} | {tokens} |" for name, chars, tokens in prompt_stats)
     attempt_detail_rows = "\n".join(
-        "| {stage} | {attempt} | {max_tokens} | {prompt_hash} | {output_hash} | {prompt_tokens} | {completion_tokens} | {total_tokens} | {hit_limit} |".format(
+        "| {stage} | {attempt} | {max_tokens} | {prompt_hash} | {output_hash} | {prompt_tokens} | {completion_tokens} | {total_tokens} | {hit_limit} | {protocol_ok} |".format(
             **row
         )
         for row in attempt_rows
@@ -939,8 +1160,8 @@ Prompt 大小估算：
 
 阶段调用复现信息：
 
-| 阶段 | 尝试 | max_tokens | prompt_hash | output_hash | prompt_tokens | completion_tokens | total_tokens | 是否触达上限 |
-| --- | ---: | ---: | --- | --- | ---: | ---: | ---: | --- |
+| 阶段 | 尝试 | max_tokens | prompt_hash | output_hash | prompt_tokens | completion_tokens | total_tokens | 是否触达上限 | 协议校验通过 |
+| --- | ---: | ---: | --- | --- | ---: | ---: | ---: | --- | --- |
 {attempt_detail_rows}
 
 ## 6. 质量门结果
