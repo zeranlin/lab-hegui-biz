@@ -116,6 +116,23 @@ def line_number_text(text: str) -> str:
     return "\n".join(f"{index:04d}: {line}" for index, line in enumerate(text.splitlines(), start=1))
 
 
+def split_numbered_text(numbered_text: str, max_chars: int) -> list[str]:
+    chunks: list[str] = []
+    current: list[str] = []
+    current_chars = 0
+    for line in numbered_text.splitlines():
+        line_chars = len(line) + 1
+        if current and current_chars + line_chars > max_chars:
+            chunks.append("\n".join(current))
+            current = []
+            current_chars = 0
+        current.append(line)
+        current_chars += line_chars
+    if current:
+        chunks.append("\n".join(current))
+    return chunks
+
+
 def count_risks(report: str) -> int:
     return len(re.findall(r"^###\s+风险\s*\d+\s*[.．、：:]", report, flags=re.MULTILINE))
 
@@ -368,6 +385,23 @@ def output_hit_limit(usage: dict, max_tokens: int) -> bool:
     return completion_tokens >= max(1, int(max_tokens * 0.98))
 
 
+def context_limit_retry_tokens(error: Exception, requested_max_tokens: int) -> int | None:
+    message = str(error)
+    if "maximum input length" not in message or "context length" not in message:
+        return None
+    input_match = re.search(r"passed\s+(\d+)\s+input tokens", message)
+    limit_match = re.search(r"maximum input length is only\s+(\d+)", message)
+    if not input_match or not limit_match:
+        return max(1000, requested_max_tokens - 1000)
+    input_tokens = int(input_match.group(1))
+    max_input_tokens = int(limit_match.group(1))
+    context_tokens = max_input_tokens + requested_max_tokens
+    next_max_tokens = context_tokens - input_tokens - 256
+    if next_max_tokens >= requested_max_tokens or next_max_tokens < 1000:
+        return None
+    return next_max_tokens
+
+
 def budget_wiki_pages(wiki_home: Path, pages: list[str], char_budget: int) -> tuple[str, list[str]]:
     chunks: list[str] = []
     loaded: list[str] = []
@@ -493,6 +527,16 @@ def remove_legacy_report_metadata(text: str) -> str:
     return "\n".join(lines).strip()
 
 
+def normalize_report_time_header(text: str, review_start_time: str, review_end_time: str) -> str:
+    lines = [
+        line
+        for line in text.splitlines()
+        if not line.startswith("审查开始时间::") and not line.startswith("审查结束时间::")
+    ]
+    body = "\n".join(lines).strip()
+    return f"审查开始时间:: {review_start_time}\n审查结束时间:: {review_end_time}\n\n{body}".rstrip()
+
+
 def chat_text(base_url: str, api_key: str, model: str, prompt: str, max_tokens: int = 8000) -> tuple[str, dict]:
     chat = post_chat_completion(base_url, api_key, model, prompt, max_tokens=max_tokens)
     message = (chat.get("choices") or [{}])[0].get("message") or {}
@@ -514,7 +558,15 @@ def chat_stage(
     current_max_tokens = max_tokens
     last_issues: list[str] = []
     for attempt in range(1, max_retries + 2):
-        content, usage = chat_text(base_url, api_key, model, current_prompt, max_tokens=current_max_tokens)
+        while True:
+            try:
+                content, usage = chat_text(base_url, api_key, model, current_prompt, max_tokens=current_max_tokens)
+                break
+            except RuntimeError as exc:
+                next_max_tokens = context_limit_retry_tokens(exc, current_max_tokens)
+                if next_max_tokens is None:
+                    raise
+                current_max_tokens = next_max_tokens
         hit_limit = output_hit_limit(usage, current_max_tokens)
         validation_issues = validator(content) if content and validator else []
         last_issues = validation_issues
@@ -875,7 +927,7 @@ def direct_chat_review(
         char_budget=62000,
     )
 
-    action_exec_prompt = f"""你是政府采购招标文件合规审查生产线的外部执行主体。
+    action_exec_prompt_prefix = f"""你是政府采购招标文件合规审查生产线的外部执行主体。
 
 请根据入口指引、文件画像、知识路由表和动作清单，执行环节四：逐动作执行。
 风险判断只能来自已路由知识、动作清单和待审文件原文；不得使用外部标注、标准答案、历史审查记录或执行器内置审查知识。
@@ -892,7 +944,9 @@ def direct_chat_review(
 
 动作清单：
 {actions}
+"""
 
+    action_exec_prompt = f"""{action_exec_prompt_prefix}
 待审文件，已加行号：
 {numbered_text}
 
@@ -901,23 +955,91 @@ def direct_chat_review(
 只输出 `04-动作执行记录` Markdown 内容。不要生成最终报告。
 每个动作都必须有状态、读取范围、原文位置或未命中原因；命中和待确认动作必须形成候选风险或说明待确认原因。
 """
-    prompt_stats.append(("04-动作执行记录", len(action_exec_prompt), estimate_tokens(action_exec_prompt)))
-    action_exec, usage = chat_stage(
-        base_url,
-        api_key,
-        model,
-        "04-动作执行记录",
-        action_exec_prompt,
-        max_tokens=16000,
-        attempt_rows=attempt_rows,
-        validator=lambda content: validate_wiki_protocol_output(
+    if estimate_tokens(action_exec_prompt) <= 110000:
+        prompt_stats.append(("04-动作执行记录", len(action_exec_prompt), estimate_tokens(action_exec_prompt)))
+        action_exec, usage = chat_stage(
+            base_url,
+            api_key,
+            model,
             "04-动作执行记录",
-            content,
-            protocol_fields["04-动作执行记录"],
-            required_action_ids=list(dict.fromkeys(active_action_ids)),
-        ),
-    )
-    usages.append(("04-动作执行记录", usage))
+            action_exec_prompt,
+            max_tokens=16000,
+            attempt_rows=attempt_rows,
+            validator=lambda content: validate_wiki_protocol_output(
+                "04-动作执行记录",
+                content,
+                protocol_fields["04-动作执行记录"],
+                required_action_ids=list(dict.fromkeys(active_action_ids)),
+            ),
+        )
+        usages.append(("04-动作执行记录", usage))
+    else:
+        action_chunks = split_numbered_text(numbered_text, max_chars=60000)
+        chunk_records: list[str] = []
+        for chunk_index, chunk in enumerate(action_chunks, start=1):
+            chunk_prompt = f"""{action_exec_prompt_prefix}
+
+本次只读取待审文件分段 {chunk_index}/{len(action_chunks)}。必须保留本分段内发现的原文位置和原文摘录。
+本阶段只输出分段动作执行记录，不生成最终 `04-动作执行记录`，不生成最终报告。
+如果某个动作在本分段没有证据，只写“本分段未命中”，不得代表全文结论。
+
+待审文件分段，已加行号：
+{chunk}
+
+请输出 `04-动作执行记录-分段{chunk_index}` Markdown 内容。
+字段必须遵循入口指引中 `04-动作执行记录` 的字段要求；命中和待确认动作必须形成候选风险或说明待确认原因。
+"""
+            stage_name = f"04-动作执行记录-分段{chunk_index:02d}"
+            prompt_stats.append((stage_name, len(chunk_prompt), estimate_tokens(chunk_prompt)))
+            chunk_record, usage = chat_stage(
+                base_url,
+                api_key,
+                model,
+                stage_name,
+                chunk_prompt,
+                max_tokens=5000,
+                attempt_rows=attempt_rows,
+                validator=lambda content: validate_wiki_protocol_output(
+                    "04-动作执行记录",
+                    content,
+                    protocol_fields["04-动作执行记录"],
+                ),
+            )
+            usages.append((stage_name, usage))
+            chunk_records.append(f"## 分段 {chunk_index}/{len(action_chunks)}\n\n{chunk_record}")
+
+        merged_chunks = "\n\n".join(chunk_records)
+        action_exec_merge_prompt = f"""{action_exec_prompt_prefix}
+
+以下是按原文行号分段生成的动作执行记录。请执行合并，不重新读取外部资料，不使用执行器内置审查知识。
+
+分段动作执行记录：
+{merged_chunks}
+
+请合并输出最终 `04-动作执行记录` Markdown 内容。不要生成最终报告。
+合并要求：
+- 每个动作都必须有状态、读取范围、原文位置或未命中原因。
+- 同一动作在多个分段命中时，应合并证据并保留来源行号。
+- 命中和待确认动作必须形成候选风险或说明待确认原因。
+- 不得把“本分段未命中”误写成全文未命中；只有所有分段均未命中时，才可写全文未命中。
+"""
+        prompt_stats.append(("04-动作执行记录-合并", len(action_exec_merge_prompt), estimate_tokens(action_exec_merge_prompt)))
+        action_exec, usage = chat_stage(
+            base_url,
+            api_key,
+            model,
+            "04-动作执行记录-合并",
+            action_exec_merge_prompt,
+            max_tokens=16000,
+            attempt_rows=attempt_rows,
+            validator=lambda content: validate_wiki_protocol_output(
+                "04-动作执行记录",
+                content,
+                protocol_fields["04-动作执行记录"],
+                required_action_ids=list(dict.fromkeys(active_action_ids)),
+            ),
+        )
+        usages.append(("04-动作执行记录", usage))
     stage_file(action_exec_path, "04-动作执行记录", action_exec)
 
     atomized_prompt = f"""你是政府采购招标文件合规审查生产线的外部执行主体。
@@ -1089,6 +1211,7 @@ def direct_chat_review(
     report_replacements[PROMPT_REVIEW_END] = review_end_time
     report = replace_prompt_placeholders(report, report_replacements)
     report = remove_legacy_report_metadata(report)
+    report = normalize_report_time_header(report, review_start_time, review_end_time)
 
     report_path.write_text(report.rstrip() + "\n", encoding="utf-8")
     risk_count = count_risks(report)
