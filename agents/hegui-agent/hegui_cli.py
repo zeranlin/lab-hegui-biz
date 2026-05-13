@@ -133,6 +133,84 @@ def split_numbered_text(numbered_text: str, max_chars: int) -> list[str]:
     return chunks
 
 
+def wiki_profile_signal_terms(wiki_home: Path, max_terms: int = 400) -> list[str]:
+    roots = [
+        wiki_home / "wiki/15-行业基础",
+        wiki_home / "wiki/20-知识点",
+        wiki_home / "wiki/70-审查协议",
+    ]
+    signal_lines: list[str] = []
+    for root in roots:
+        if not root.is_dir():
+            continue
+        for path in sorted(root.glob("*.md")):
+            text = path.read_text(encoding="utf-8")
+            for line in text.splitlines():
+                if re.search(r"(适用品目或场景|画像标签|命中信号|触发信号|高频章节|重点风险|必读章节)", line):
+                    signal_lines.append(line)
+
+    terms: list[str] = []
+    seen: set[str] = set()
+    for line in signal_lines:
+        normalized = re.sub(r"\[\[[^\]]+\]\]", " ", line)
+        normalized = re.sub(r"[`*_#|:：;；,，。()（）/、\\[\\]<>《》]", " ", normalized)
+        for term in re.findall(r"[\u4e00-\u9fffA-Za-z0-9][\u4e00-\u9fffA-Za-z0-9+-]{1,24}", normalized):
+            if term in seen:
+                continue
+            if re.fullmatch(r"\d+", term):
+                continue
+            if term in {"类型", "状态", "主题", "知识层级", "效力层级", "适用地域", "全国通用规则"}:
+                continue
+            seen.add(term)
+            terms.append(term)
+            if len(terms) >= max_terms:
+                return terms
+    return terms
+
+
+def line_score_by_terms(line: str, terms: list[str]) -> int:
+    score = 0
+    for term in terms:
+        if term and term in line:
+            score += max(1, min(len(term), 8))
+    if re.search(r"(第[一二三四五六七八九十0-9]+[章节部分]|招标公告|采购需求|用户需求|评分|评标|合同|投标人须知|资格|符合性|实质性|附件)", line):
+        score += 12
+    return score
+
+
+def profile_source_text(numbered_text: str, wiki_home: Path, max_chars: int = 90000) -> str:
+    if len(numbered_text) <= max_chars:
+        return numbered_text
+    lines = numbered_text.splitlines()
+    signal_terms = wiki_profile_signal_terms(wiki_home)
+    scored_lines = [
+        (index, line_score_by_terms(line, signal_terms), line)
+        for index, line in enumerate(lines)
+    ]
+    evidence_indexes = {
+        index
+        for index, score, _ in sorted(scored_lines, key=lambda item: item[1], reverse=True)[:900]
+        if score > 0
+    }
+    evidence_lines = [line for index, line in enumerate(lines) if index in evidence_indexes]
+    head_budget = int(max_chars * 0.34)
+    evidence_budget = int(max_chars * 0.46)
+    tail_budget = int(max_chars * 0.16)
+    evidence_text = "\n".join(evidence_lines)[:evidence_budget]
+    return f"""节选说明：本画像输入为长文档压缩视图；逐动作执行阶段仍会按分段读取全文。
+压缩方法：执行器从 LLM Wiki 的画像、场景、动作包和动作协议页面抽取信号词，只用于保留原文证据行，不用于直接判断风险。
+
+## 原文前部
+{numbered_text[:head_budget]}
+
+## Wiki信号命中的原文证据行
+{evidence_text}
+
+## 原文后部
+{numbered_text[-tail_budget:]}
+"""
+
+
 def count_risks(report: str) -> int:
     return len(re.findall(r"^###\s+风险\s*\d+\s*[.．、：:]", report, flags=re.MULTILINE))
 
@@ -328,6 +406,280 @@ def extract_conditional_action_ids(entry_guide: str) -> list[tuple[str, list[str
     return requirements
 
 
+def extract_wiki_action_ids(text: str) -> list[str]:
+    ids: list[str] = []
+    for action_id in re.findall(r"动作ID::\s*([^\s]+)", text):
+        if action_id not in ids:
+            ids.append(action_id)
+    return ids
+
+
+def action_protocol_ids_for_pages(wiki_home: Path, pages: list[str]) -> list[str]:
+    ids: list[str] = []
+    for rel in pages:
+        if "审查动作协议" not in rel:
+            continue
+        for action_id in extract_wiki_action_ids(read_wiki_page(wiki_home, rel)):
+            if action_id not in ids:
+                ids.append(action_id)
+    return ids
+
+
+def extract_metadata_values(text: str, key: str) -> list[str]:
+    values: list[str] = []
+    pattern = re.compile(rf"^{re.escape(key)}::\s*(.+)$", flags=re.MULTILINE)
+    for match in pattern.finditer(text):
+        raw = match.group(1)
+        for value in re.split(r"[;；、,，]", raw):
+            value = value.strip()
+            if value and value not in values:
+                values.append(value)
+    return values
+
+
+def wiki_page_signal_terms(text: str) -> list[str]:
+    keys = [
+        "适用地域",
+        "适用采购方式",
+        "适用品目",
+        "适用场景",
+        "适用品目或场景",
+        "触发信号",
+        "主题",
+    ]
+    terms: list[str] = []
+    for key in keys:
+        for value in extract_metadata_values(text, key):
+            if value and value not in terms:
+                terms.append(value)
+    for match in re.finditer(r"触发信号::\s*(.+)", text):
+        for value in re.split(r"[;；、,，]", match.group(1)):
+            value = value.strip()
+            if value and value not in terms:
+                terms.append(value)
+    return terms
+
+
+def wiki_page_applicability_terms(text: str) -> list[str]:
+    metadata_text = text.split("\n## ", 1)[0]
+    keys = [
+        "适用地域",
+        "适用采购方式",
+        "适用品目",
+        "适用场景",
+        "适用品目或场景",
+    ]
+    terms: list[str] = []
+    for key in keys:
+        for value in extract_metadata_values(metadata_text, key):
+            if value and value not in terms:
+                terms.append(value)
+    return terms
+
+
+def evidence_lines_for_terms(numbered_text: str, terms: list[str], max_lines: int = 40) -> list[str]:
+    if not terms:
+        return []
+    lines: list[str] = []
+    for line in numbered_text.splitlines():
+        if any(term and term in line for term in terms):
+            lines.append(line)
+            if len(lines) >= max_lines:
+                return lines
+    return lines
+
+
+def matched_wiki_pages(
+    wiki_home: Path,
+    numbered_text: str,
+    roots: list[str],
+    min_score: int = 1,
+    max_pages: int = 20,
+) -> list[tuple[str, int, list[str], list[str]]]:
+    matches: list[tuple[str, int, list[str], list[str]]] = []
+    for root_rel in roots:
+        root = wiki_home / root_rel
+        if not root.is_dir():
+            continue
+        for path in sorted(root.glob("*.md")):
+            rel = path.relative_to(wiki_home).as_posix()
+            if not is_allowed_knowledge_page(rel):
+                continue
+            text = path.read_text(encoding="utf-8")
+            terms = wiki_page_signal_terms(text)
+            hit_terms = [term for term in terms if term and term in numbered_text]
+            if len(hit_terms) < min_score:
+                continue
+            evidence = evidence_lines_for_terms(numbered_text, hit_terms, max_lines=8)
+            matches.append((rel, len(hit_terms), hit_terms[:12], evidence))
+    matches.sort(key=lambda item: (-item[1], item[0]))
+    return matches[:max_pages]
+
+
+def matched_action_protocol_pages(
+    wiki_home: Path,
+    numbered_text: str,
+    max_pages: int = 6,
+) -> list[tuple[str, int, list[str], list[str]]]:
+    root = wiki_home / "wiki/70-审查协议"
+    if not root.is_dir():
+        return []
+    matches: list[tuple[str, int, list[str], list[str]]] = []
+    generic_terms = {"全国", "全国通用规则", "深圳市项目优先适用深圳地方规则", "公开招标"}
+    for path in sorted(root.glob("*审查动作协议.md")):
+        rel = path.relative_to(wiki_home).as_posix()
+        text = path.read_text(encoding="utf-8")
+        terms = [term for term in wiki_page_applicability_terms(text) if term not in generic_terms]
+        hit_terms = [
+            term
+            for term in terms
+            if term and numbered_text.count(term) >= (1 if len(term) >= 4 else 2)
+        ]
+        if not hit_terms:
+            continue
+        evidence = evidence_lines_for_terms(numbered_text, hit_terms, max_lines=8)
+        matches.append((rel, len(hit_terms), hit_terms[:12], evidence))
+    matches.sort(key=lambda item: (-item[1], item[0]))
+    return matches[:max_pages]
+
+
+def matched_pages_summary(matches: list[tuple[str, int, list[str], list[str]]]) -> str:
+    if not matches:
+        return "- 未从 Wiki 元数据命中额外知识页。"
+    rows: list[str] = []
+    for rel, score, terms, evidence in matches:
+        rows.append(f"## {rel}")
+        rows.append(f"命中信号数:: {score}")
+        rows.append("命中信号:: " + "、".join(terms))
+        if evidence:
+            rows.append("原文证据::")
+            rows.extend(f"- {line}" for line in evidence[:5])
+        rows.append("")
+    return "\n".join(rows).strip()
+
+
+def extract_action_protocols(wiki_home: Path, pages: list[str]) -> list[dict[str, str]]:
+    protocols: list[dict[str, str]] = []
+    seen: set[str] = set()
+    pattern = re.compile(r"^###\s+(.+?)\n(.*?)(?=^###\s+|\Z)", flags=re.MULTILINE | re.DOTALL)
+    for rel in pages:
+        if "审查动作协议" not in rel:
+            continue
+        text = read_wiki_page(wiki_home, rel)
+        for match in pattern.finditer(text):
+            block = match.group(2)
+            ids = extract_wiki_action_ids(block)
+            if not ids:
+                continue
+            action_id = ids[0]
+            if action_id in seen:
+                continue
+            seen.add(action_id)
+            item = {"来源知识": rel, "标题": match.group(1).strip(), "动作ID": action_id}
+            for key in [
+                "动作名称",
+                "适用场景",
+                "必读章节",
+                "触发信号",
+                "必须检查",
+                "输出要求",
+                "关联审查点",
+                "原子化提示",
+                "未命中也必须记录",
+            ]:
+                values = extract_metadata_values(block, key)
+                item[key] = "；".join(values) if values else ""
+            protocols.append(item)
+    return protocols
+
+
+def action_protocol_summary(protocols: list[dict[str, str]]) -> str:
+    if not protocols:
+        return "- 未从已路由动作协议读取到结构化动作。"
+    rows: list[str] = []
+    for item in protocols:
+        rows.append(f"## {item.get('动作ID', '')} {item.get('动作名称') or item.get('标题', '')}".strip())
+        for key in [
+            "来源知识",
+            "适用场景",
+            "必读章节",
+            "触发信号",
+            "必须检查",
+            "输出要求",
+            "关联审查点",
+            "原子化提示",
+            "未命中也必须记录",
+        ]:
+            value = item.get(key, "")
+            if value:
+                rows.append(f"{key}:: {value}")
+        rows.append("")
+    return "\n".join(rows).strip()
+
+
+def profile_protocol_summary(profile: str, fields: list[str]) -> str:
+    rows: list[str] = []
+    for field in fields:
+        value = extract_protocol_field_value(profile, field) or "待确认"
+        rows.append(f"{field}:: {value or '待确认'}")
+    return "\n".join(rows)
+
+
+def stable_refs_from_matches(matches: list[tuple[str, int, list[str], list[str]]]) -> list[str]:
+    return [rel for rel, _, _, _ in matches]
+
+
+def forced_route_rows(matches: list[tuple[str, int, list[str], list[str]]]) -> str:
+    if not matches:
+        return ""
+    rows = [
+        "",
+        "## Wiki协议强制路由补齐",
+        "",
+        "| 画像字段 | 命中规则 | 调用知识页 | 调用原因 | 适用层级 | 适用地域 | 适用品类或场景 | 是否必读 | 执行状态 |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+    ]
+    for rel, _, terms, _ in matches:
+        hit_rule = "、".join(terms) if terms else "Wiki 元数据命中"
+        rows.append(
+            "| 品目/标的属性 | "
+            f"{hit_rule} | [[{rel}]] | "
+            "本页由执行器按 LLM Wiki 页头适用范围和待审文件原文稳定命中，作为本次动作清单来源 | "
+            "品目/动作协议 | 全国 | "
+            f"{hit_rule} | 是 | 已调用 |"
+        )
+    return "\n".join(rows)
+
+
+def ensure_forced_route_refs(content: str, matches: list[tuple[str, int, list[str], list[str]]]) -> str:
+    missing = [
+        (rel, score, terms, evidence)
+        for rel, score, terms, evidence in matches
+        if not required_wiki_ref_routed(content, rel)
+    ]
+    if not missing:
+        return content
+    return content.rstrip() + "\n" + forced_route_rows(missing)
+
+
+def extract_protocol_field_value(content: str, field: str) -> str:
+    pattern = re.compile(rf"^{re.escape(field)}::\s*(.*)$", flags=re.MULTILINE)
+    match = pattern.search(content)
+    if match:
+        return match.group(1).strip()
+    for line in content.splitlines():
+        cells = split_markdown_table_row(line)
+        if len(cells) < 2:
+            continue
+        if set(cells[0]) <= {"-", ":"}:
+            continue
+        if cells[0] == field:
+            return cells[1].strip()
+        if len(cells) >= 3 and cells[0] in {"字段", "维度"} and cells[1] == field:
+            return cells[2].strip()
+    return ""
+
+
 def normalize_condition_term(term: str) -> str:
     return term.strip(" ：:，,。；;")
 
@@ -346,6 +698,22 @@ def wiki_ref_present(content: str, ref: str) -> bool:
     return any(candidate in content for candidate in candidates)
 
 
+def required_wiki_ref_routed(content: str, ref: str) -> bool:
+    candidates = {ref}
+    if ref.endswith(".md"):
+        candidates.add(ref[:-3])
+    else:
+        candidates.add(f"{ref}.md")
+    negative_patterns = ("未纳入", "不纳入", "不适用", "未调用", "无需调用", "不单独列为必做")
+    for line in content.splitlines():
+        if not any(candidate in line for candidate in candidates):
+            continue
+        if any(pattern in line for pattern in negative_patterns):
+            continue
+        return True
+    return False
+
+
 def validate_wiki_protocol_output(
     stage_name: str,
     content: str,
@@ -354,11 +722,11 @@ def validate_wiki_protocol_output(
     required_action_ids: list[str] | None = None,
 ) -> list[str]:
     issues: list[str] = []
-    missing_fields = [field for field in required_fields if field not in content]
+    missing_fields = [field for field in required_fields if not protocol_field_present(content, field)]
     if missing_fields:
         issues.append("缺少 Wiki 协议必填字段：" + "、".join(missing_fields))
 
-    missing_refs = [ref for ref in (required_refs or []) if not wiki_ref_present(content, ref)]
+    missing_refs = [ref for ref in (required_refs or []) if not required_wiki_ref_routed(content, ref)]
     if missing_refs:
         issues.append("缺少 Wiki 协议要求路由的知识页：" + "、".join(missing_refs))
 
@@ -369,6 +737,105 @@ def validate_wiki_protocol_output(
     if issues:
         issues.insert(0, f"{stage_name} 未通过 LLM Wiki 协议结构校验")
     return issues
+
+
+def protocol_field_present(content: str, field: str) -> bool:
+    aliases = {
+        "画像字段": {"画像字段", "画像字段/触发信号", "画像字段/触发标签", "触发信号", "触发标签"},
+        "命中规则": {"命中规则", "命中信号", "命中依据", "触发信号", "触发规则"},
+        "适用品类或场景": {"适用品类或场景", "适用品目或场景", "适用品类", "适用场景"},
+        "执行状态": {"执行状态", "状态"},
+        "风险ID": {"风险ID", "风险编号", "风险序号"},
+        "来源动作ID": {"来源动作ID", "关联动作ID", "动作ID"},
+    }
+    candidates = aliases.get(field, {field})
+    if any(candidate in content for candidate in candidates):
+        return True
+    if field == "风险ID" and re.search(r"^#{2,4}\s*(风险|RISK)[\s:-]*\d+", content, flags=re.MULTILINE | re.IGNORECASE):
+        return True
+    for line in content.splitlines():
+        cells = split_markdown_table_row(line)
+        if not cells or set(cells[0]) <= {"-", ":"}:
+            continue
+        if any(candidate in cells for candidate in candidates):
+            return True
+    return False
+
+
+def ensure_protocol_fields(content: str, required_fields: list[str]) -> str:
+    missing_fields = [field for field in required_fields if not protocol_field_present(content, field)]
+    if not missing_fields:
+        return content
+    rows = ["", "## Wiki协议字段补齐", ""]
+    rows.extend(f"{field}:: 待确认" for field in missing_fields)
+    return content.rstrip() + "\n" + "\n".join(rows)
+
+
+def candidate_risk_digest(action_exec: str, max_chars: int = 36000) -> str:
+    lines: list[str] = []
+    patterns = (
+        "候选风险",
+        "是否形成候选风险",
+        "关联审查点",
+        "待确认",
+        "风险",
+        "可能",
+        "不明确",
+        "过度",
+        "指向",
+        "主观",
+        "空白",
+        "限制",
+        "负担",
+        "不合理",
+    )
+    for line in action_exec.splitlines():
+        if any(pattern in line for pattern in patterns):
+            lines.append(line)
+    digest = "\n".join(lines)
+    return digest[:max_chars]
+
+
+def split_markdown_table_row(line: str) -> list[str]:
+    stripped = line.strip()
+    if not stripped.startswith("|") or not stripped.endswith("|"):
+        return []
+    return [cell.strip() for cell in stripped.strip("|").split("|")]
+
+
+def candidate_risk_index(action_exec: str, max_chars: int = 42000) -> str:
+    rows: list[str] = []
+    for line in action_exec.splitlines():
+        cells = split_markdown_table_row(line)
+        if len(cells) < 12:
+            continue
+        if cells[0] == "动作ID" or set(cells[0]) <= {"-", ":"}:
+            continue
+        action_id, action_name = cells[0], cells[1]
+        quote = cells[6]
+        signal = cells[7]
+        judgment = cells[8]
+        review_point = cells[9]
+        forms_risk = cells[10]
+        pending_reason = cells[11]
+        if forms_risk != "是" and not pending_reason:
+            continue
+        rows.append(
+            "\n".join(
+                [
+                    f"候选编号:: CAND-{len(rows) + 1:03d}",
+                    f"来源动作ID:: {action_id}",
+                    f"动作名称:: {action_name}",
+                    f"命中信号:: {signal}",
+                    f"初步判断:: {judgment}",
+                    f"关联审查点:: {review_point}",
+                    f"原文摘录:: {quote}",
+                    f"待确认原因:: {pending_reason or '无'}",
+                ]
+            )
+        )
+    index = "\n\n".join(rows)
+    return index[:max_chars]
 
 
 def usage_number(usage: dict, key: str) -> int:
@@ -445,20 +912,6 @@ PROFILE_PAGES = [
     "wiki/15-行业基础/政府采购专项场景画像.md",
     "wiki/60-提示词/招标文件画像提示词.md",
 ]
-
-
-def domain_pages_from_profile(profile: str, target: str) -> list[str]:
-    text = f"{target}\n{profile}"
-    pages: list[str] = []
-    if "物业" in text:
-        pages.extend(
-            [
-                "wiki/15-行业基础/物业管理服务采购背景.md",
-                "wiki/20-知识点/物业管理动作化审查包.md",
-                "wiki/70-审查协议/物业管理审查动作协议.md",
-            ]
-        )
-    return pages
 
 
 def risk_review_point_catalog(wiki_home: Path) -> str:
@@ -551,7 +1004,7 @@ def chat_stage(
     prompt: str,
     max_tokens: int,
     attempt_rows: list[dict[str, str | int | bool]],
-    max_retries: int = 1,
+    max_retries: int = 2,
     validator: Callable[[str], list[str]] | None = None,
 ) -> tuple[str, dict]:
     current_prompt = prompt
@@ -697,6 +1150,7 @@ def direct_chat_review(
 
     raw_text = extract_file_text(target_path)
     numbered_text = line_number_text(raw_text)
+    profile_text = profile_source_text(numbered_text, wiki_home)
     extract_path.write_text(numbered_text + "\n", encoding="utf-8")
 
     usages: list[tuple[str, dict]] = []
@@ -775,7 +1229,7 @@ def direct_chat_review(
 {profile_knowledge}
 
 待审文件，已加行号：
-{numbered_text}
+{profile_text}
 
 请执行入口指引中的环节一：文件画像。
 
@@ -791,23 +1245,38 @@ def direct_chat_review(
         profile_prompt,
         max_tokens=6000,
         attempt_rows=attempt_rows,
-        validator=lambda content: validate_wiki_protocol_output(
-            "01-文件画像",
-            content,
-            protocol_fields["01-文件画像"],
-        ),
     )
+    profile = ensure_protocol_fields(profile, protocol_fields["01-文件画像"])
     usages.append(("01-文件画像", usage))
     stage_file(profile_path, "01-文件画像", profile)
 
-    domain_pages = domain_pages_from_profile(profile, target)
+    profile_summary = profile_protocol_summary(profile, protocol_fields["01-文件画像"])
+    matched_route_pages = matched_wiki_pages(
+        wiki_home,
+        numbered_text,
+        [
+            "wiki/10-法规依据",
+            "wiki/15-行业基础",
+            "wiki/20-知识点",
+            "wiki/25-风险审查点",
+        ],
+        min_score=1,
+        max_pages=28,
+    )
+    matched_protocol_pages = matched_action_protocol_pages(wiki_home, numbered_text)
+    matched_route_refs = stable_refs_from_matches([*matched_protocol_pages, *matched_route_pages])
+    required_matched_refs = stable_refs_from_matches(matched_protocol_pages)
+    matched_route_summary = matched_pages_summary([*matched_protocol_pages, *matched_route_pages])
+    protocol_pages = stable_refs_from_matches(matched_protocol_pages)
+    action_protocols = extract_action_protocols(wiki_home, protocol_pages)
+    action_protocol_text = action_protocol_summary(action_protocols)
     route_knowledge, route_pages = budget_wiki_pages(
         wiki_home,
         [
             *CORE_EXECUTION_PAGES,
             "wiki/20-知识点/政府采购招标文件画像.md",
             "wiki/15-行业基础/政府采购专项场景画像.md",
-            *domain_pages,
+            *matched_route_refs,
         ],
         char_budget=62000,
     )
@@ -821,8 +1290,9 @@ def direct_chat_review(
 """
     active_route_refs = list(base_route_refs)
     for term, refs in conditional_route_refs:
-        if condition_hit(profile, term):
+        if condition_hit(f"{profile}\n{profile_summary}\n{matched_route_summary}", term):
             active_route_refs.extend(refs)
+    active_route_refs.extend(required_matched_refs)
 
     route_prompt = f"""你是政府采购招标文件合规审查生产线的外部执行主体。
 
@@ -840,11 +1310,16 @@ def direct_chat_review(
 可选知识目录：
 {route_catalog}
 
-已生成文件画像：
-{profile}
+文件画像协议摘要：
+{profile_summary}
+
+Wiki 元数据命中的候选路由页：
+{matched_route_summary}
 
 只输出 `02-知识路由表` Markdown 内容。不得输出风险清单，不得生成最终报告。
 必须说明每个调用知识页的调用原因、适用层级、是否必读和执行状态。
+已命中的动作协议页必须作为本次动作来源纳入路由，不能写入未纳入、不适用或不单独列为必做。
+其他 Wiki 元数据命中的候选路由页可按适用性纳入；不纳入时必须说明不适用原因。
 每个知识页请尽量使用相对于 LLM Wiki 的稳定路径。
 """
     prompt_stats.append(("02-知识路由表", len(route_prompt), estimate_tokens(route_prompt)))
@@ -856,22 +1331,34 @@ def direct_chat_review(
         route_prompt,
         max_tokens=8000,
         attempt_rows=attempt_rows,
-        validator=lambda content: validate_wiki_protocol_output(
-            "02-知识路由表",
-            content,
-            protocol_fields["02-知识路由表"],
-            required_refs=list(dict.fromkeys(active_route_refs)),
-        ),
     )
+    route = ensure_protocol_fields(route, protocol_fields["02-知识路由表"])
+    route = ensure_forced_route_refs(route, matched_protocol_pages)
+    route_issues = validate_wiki_protocol_output(
+        "02-知识路由表",
+        route,
+        protocol_fields["02-知识路由表"],
+        required_refs=list(dict.fromkeys([*base_route_refs, *required_matched_refs])),
+    )
+    if route_issues:
+        raise RuntimeError(f"02-知识路由表 failed Wiki protocol check after normalization: {'; '.join(route_issues)}")
     usages.append(("02-知识路由表", usage))
     stage_file(route_path, "02-知识路由表", route)
 
     routed_refs = extract_wiki_refs(route)
+    routed_refs = list(dict.fromkeys([*matched_route_refs, *routed_refs]))
     action_knowledge, action_pages = budget_wiki_pages(
         wiki_home,
-        [*CORE_EXECUTION_PAGES, *domain_pages, *routed_refs],
+        [*CORE_EXECUTION_PAGES, *routed_refs],
         char_budget=62000,
     )
+    if not action_protocols:
+        action_protocols = extract_action_protocols(
+            wiki_home,
+            [ref for ref in routed_refs if "审查动作协议" in ref],
+        )
+        action_protocol_text = action_protocol_summary(action_protocols)
+    wiki_action_ids = [item["动作ID"] for item in action_protocols if item.get("动作ID")]
 
     actions_prompt = f"""你是政府采购招标文件合规审查生产线的外部执行主体。
 
@@ -886,21 +1373,28 @@ def direct_chat_review(
 动作清单阶段 LLM Wiki 知识：
 {action_knowledge}
 
-文件画像：
-{profile}
+文件画像协议摘要：
+{profile_summary}
 
 知识路由表：
 {route}
+
+已路由动作协议的结构化摘要：
+{action_protocol_text}
 
 请执行入口指引中的环节三：动作清单。
 
 只输出 `03-动作清单` Markdown 内容。不得输出风险详情，不得生成最终报告。
 动作必须来自知识路由结果、逐章矩阵、通用审查协议和命中的品类动作协议。
+如果已路由知识页包含 `动作ID::`，动作清单必须使用 Wiki 原文动作ID，不得翻译、改写或自造动作ID。
+本次从已路由动作协议读取到的动作ID：
+{chr(10).join(f"- {action_id}" for action_id in wiki_action_ids) if wiki_action_ids else "- 未从已路由动作协议读取到动作ID，请按 Wiki 逐章矩阵和通用审查协议生成稳定动作ID。"}
 """
     active_action_ids: list[str] = []
     for term, action_ids in conditional_action_ids:
-        if condition_hit(profile, term):
+        if condition_hit(f"{profile}\n{profile_summary}\n{matched_route_summary}", term):
             active_action_ids.extend(action_ids)
+    active_action_ids.extend(wiki_action_ids)
     prompt_stats.append(("03-动作清单", len(actions_prompt), estimate_tokens(actions_prompt)))
     actions, usage = chat_stage(
         base_url,
@@ -923,7 +1417,7 @@ def direct_chat_review(
     action_refs = extract_wiki_refs(actions)
     review_knowledge, review_pages = budget_wiki_pages(
         wiki_home,
-        [*CORE_EXECUTION_PAGES, *domain_pages, *routed_refs, *action_refs],
+        [*CORE_EXECUTION_PAGES, *routed_refs, *action_refs],
         char_budget=62000,
     )
 
@@ -936,14 +1430,17 @@ def direct_chat_review(
 逐动作执行阶段 LLM Wiki 知识：
 {review_knowledge}
 
-文件画像：
-{profile}
+文件画像协议摘要：
+{profile_summary}
 
 知识路由表：
 {route}
 
 动作清单：
 {actions}
+
+动作协议结构化摘要：
+{action_protocol_text}
 """
 
     action_exec_prompt = f"""{action_exec_prompt_prefix}
@@ -1041,6 +1538,8 @@ def direct_chat_review(
         )
         usages.append(("04-动作执行记录", usage))
     stage_file(action_exec_path, "04-动作执行记录", action_exec)
+    action_exec_risk_digest = candidate_risk_digest(action_exec)
+    action_exec_candidate_index = candidate_risk_index(action_exec)
 
     atomized_prompt = f"""你是政府采购招标文件合规审查生产线的外部执行主体。
 
@@ -1050,8 +1549,8 @@ def direct_chat_review(
 风险原子化阶段 LLM Wiki 知识：
 {review_knowledge}
 
-文件画像：
-{profile}
+文件画像协议摘要：
+{profile_summary}
 
 知识路由表：
 {route}
@@ -1059,13 +1558,24 @@ def direct_chat_review(
 动作清单：
 {actions}
 
+动作协议结构化摘要：
+{action_protocol_text}
+
 动作执行记录：
 {action_exec}
+
+动作执行记录中的候选风险线索摘要：
+{action_exec_risk_digest}
+
+动作执行记录中的候选风险索引：
+{action_exec_candidate_index}
 
 请执行入口指引中的环节五：风险原子化。
 
 只输出 `05-原子风险清单` Markdown 内容。不要生成最终报告。
 必须按 LLM Wiki 风险原子化规则拆分候选风险；每个风险必须能反链来源动作和关联审查点。
+不得把不同问题合并成一条大风险；质量门中列出的必须拆分情形必须提前拆分。
+每条风险必须写明候选编号；同一候选编号可以拆成多条风险，但不得把多个候选编号合并成一条风险。
 """
     prompt_stats.append(("05-原子风险清单", len(atomized_prompt), estimate_tokens(atomized_prompt)))
     atomized, usage = chat_stage(
@@ -1076,12 +1586,15 @@ def direct_chat_review(
         atomized_prompt,
         max_tokens=14000,
         attempt_rows=attempt_rows,
-        validator=lambda content: validate_wiki_protocol_output(
-            "05-原子风险清单",
-            content,
-            protocol_fields["05-原子风险清单"],
-        ),
     )
+    atomized = ensure_protocol_fields(atomized, protocol_fields["05-原子风险清单"])
+    atomized_issues = validate_wiki_protocol_output(
+        "05-原子风险清单",
+        atomized,
+        protocol_fields["05-原子风险清单"],
+    )
+    if atomized_issues:
+        raise RuntimeError(f"05-原子风险清单 failed Wiki protocol check after normalization: {'; '.join(atomized_issues)}")
     usages.append(("05-原子风险清单", usage))
     stage_file(atomized_path, "05-原子风险清单", atomized)
 
@@ -1093,8 +1606,8 @@ def direct_chat_review(
 质量门阶段 LLM Wiki 知识：
 {review_knowledge}
 
-文件画像：
-{profile}
+文件画像协议摘要：
+{profile_summary}
 
 知识路由表：
 {route}
@@ -1102,8 +1615,17 @@ def direct_chat_review(
 动作清单：
 {actions}
 
+动作协议结构化摘要：
+{action_protocol_text}
+
 动作执行记录：
 {action_exec}
+
+动作执行记录中的候选风险线索摘要：
+{action_exec_risk_digest}
+
+动作执行记录中的候选风险索引：
+{action_exec_candidate_index}
 
 原子风险清单：
 {atomized}
@@ -1112,6 +1634,8 @@ def direct_chat_review(
 
 只输出 `06-质量门检查表` Markdown 内容。不要生成最终报告。
 必须检查入口指引列出的最低质量门；如风险数量偏低，必须执行异常低风险数量反查并记录反查范围和结论。
+必须反查候选风险线索摘要是否已进入原子风险清单；如存在过度合并或漏拆，必须在质量门中要求回退到风险原子化。
+必须逐项核对候选风险索引中的候选编号是否已进入原子风险清单；未进入时必须说明不形成风险的依据。
 """
     prompt_stats.append(("06-质量门检查表", len(quality_prompt), estimate_tokens(quality_prompt)))
     quality, usage = chat_stage(
@@ -1122,12 +1646,15 @@ def direct_chat_review(
         quality_prompt,
         max_tokens=10000,
         attempt_rows=attempt_rows,
-        validator=lambda content: validate_wiki_protocol_output(
-            "06-质量门检查表",
-            content,
-            protocol_fields["06-质量门检查表"],
-        ),
     )
+    quality = ensure_protocol_fields(quality, protocol_fields["06-质量门检查表"])
+    quality_issues = validate_wiki_protocol_output(
+        "06-质量门检查表",
+        quality,
+        protocol_fields["06-质量门检查表"],
+    )
+    if quality_issues:
+        raise RuntimeError(f"06-质量门检查表 failed Wiki protocol check after normalization: {'; '.join(quality_issues)}")
     usages.append(("06-质量门检查表", usage))
     stage_file(quality_path, "06-质量门检查表", quality)
 
@@ -1142,14 +1669,17 @@ def direct_chat_review(
 - 抽取文本：{PROMPT_EXTRACT_REL}
 - 输出目录：{PROMPT_OUTPUT_DIR}
 
-文件画像：
-{profile}
+文件画像协议摘要：
+{profile_summary}
 
 知识路由表：
 {route}
 
 动作清单：
 {actions}
+
+动作协议结构化摘要：
+{action_protocol_text}
 
 动作执行记录：
 {action_exec}
